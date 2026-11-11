@@ -11,8 +11,8 @@ android {
         applicationId = "com.cid0980.connectwin"
         minSdk = 30
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.2.1"
+        versionCode = 5
+        versionName = "1.3.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -73,6 +73,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")

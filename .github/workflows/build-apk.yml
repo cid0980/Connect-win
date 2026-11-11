@@ -52,7 +52,7 @@ jobs:
           SIGNING_KEY_PASS: ${{ secrets.SIGNING_KEY_PASS }}
         run: |
           test -n "$SIGNING_STORE_PASS" && test -n "$SIGNING_KEY_ALIAS" && test -n "$SIGNING_KEY_PASS"
-          gradle --no-daemon assembleRelease
+          gradle --no-daemon testDebugUnitTest assembleRelease
           cp app/build/outputs/apk/release/app-release.apk Connect-win-arm64.apk
       - uses: actions/upload-artifact@v4
         with:

@@ -37,6 +37,7 @@ class BridgeAccessibilityService : AccessibilityService() {
     }
 
     private val shotExecutor = Executors.newSingleThreadExecutor()
+    private val arenaMonitor by lazy { ArenaCompletionMonitor(this) }
 
     data class ParsedNode(
         val ref: Int,
@@ -84,6 +85,7 @@ class BridgeAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         BridgeState.log("AccessibilityService connected")
+        arenaMonitor.start()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -103,6 +105,7 @@ class BridgeAccessibilityService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        arenaMonitor.stop()
         if (instance === this) instance = null
         BridgeState.log("AccessibilityService disconnected")
         super.onDestroy()

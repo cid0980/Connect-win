@@ -221,6 +221,42 @@ class MainActivity : AppCompatActivity() {
         connCard.addView(btnRow)
         root.addView(connCard)
 
+        // Local, best-effort monitor; no conversation content is saved or transmitted.
+        val arenaCard = makeCard(Color.parseColor("#A78BFA"))
+        arenaCard.addView(TextView(this).apply {
+            text = "Arena completion notification"
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#F8FAFC"))
+        })
+        arenaCard.addView(Switch(this).apply {
+            text = "Notify when Arena finishes"
+            setTextColor(Color.parseColor("#CBD5E1"))
+            isChecked = ArenaCompletionMonitor.enabled(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                ArenaCompletionMonitor.setEnabled(this@MainActivity, checked)
+                if (checked && Build.VERSION.SDK_INT >= 33 && !PhoneController.hasPerm(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS)) {
+                    permLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                }
+            }
+        })
+        arenaCard.addView(TextView(this).apply {
+            text = "Best effort: keep the Arena agent page visible in Chrome while it works. Accessibility and notifications must be enabled. The detector reads only the page address and composer controls locally; it does not store chat content. It may miss background/locked pages or alert when generation is stopped or paused. Sound follows Android notification and Do Not Disturb settings."
+            textSize = 12f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(8), 0, dp(8))
+        })
+        arenaCard.addView(makeButton("Test notification sound", "#334155", "#F8FAFC") {
+            if (Build.VERSION.SDK_INT >= 33 && !PhoneController.hasPerm(this, Manifest.permission.POST_NOTIFICATIONS)) {
+                permLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                Toast.makeText(this, "Allow notifications, then tap Test again.", Toast.LENGTH_LONG).show()
+            } else {
+                val sent = ArenaCompletionMonitor.notify(this, test = true)
+                Toast.makeText(this, if (sent) "Test sent. Check notification sound settings if silent." else "Enable Connect-win notifications in Android settings.", Toast.LENGTH_LONG).show()
+            }
+        })
+        root.addView(arenaCard)
+
         // 2. Android 13-16 Restricted Settings Helper Card
         if (Build.VERSION.SDK_INT >= 33) {
             val restrictCard = makeCard(Color.parseColor("#F59E0B"))
