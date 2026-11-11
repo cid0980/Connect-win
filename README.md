@@ -64,3 +64,7 @@ curl -s -X POST "$U/gui/batch" -H "$H" -H "Content-Type: application/json" -d '{
 - Binds locally to `127.0.0.1:8765` behind constant-time `X-Bridge-Token` authentication.
 - Shows a **persistent Foreground Notification** whenever active with a **1-Tap STOP** kill-switch.
 - Logs every request to the in-app **Live Audit Log**.
+
+## Experimental persistent control
+
+The authenticated WebSocket endpoint `/ws` accepts an `X-Bridge-Token` header; browser-origin connections and URL tokens are rejected. It offers JSON operations `ping`, `ui_state`, `shot` (JPEG, base64), and `batch` using the same ordered steps as `/gui/batch` (maximum 100). A token rotation invalidates subsequent commands on existing sockets. Example client: `agent/fast_bridge.py` (requires `websocket-client`). Use only on a trusted device and do not share the token. Screenshots are on-demand, not a video stream. Continuous real-time play and latency improvements have not yet been verified on a device.

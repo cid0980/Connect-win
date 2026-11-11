@@ -3,6 +3,8 @@ package com.cid0980.connectwin
 import android.content.Context
 import android.util.Base64
 import fi.iki.elonen.NanoHTTPD
+import fi.iki.elonen.NanoWSD
+import java.io.IOException
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -12,7 +14,7 @@ import java.io.FileInputStream
 class BridgeHttpServer(
     private val context: Context,
     port: Int = BridgeState.HTTP_PORT
-) : NanoHTTPD("127.0.0.1", port) {
+) : NanoWSD("127.0.0.1", port) {
 
     private fun jsonResp(status: Response.IStatus, obj: JSONObject): Response =
         newFixedLengthResponse(status, "application/json; charset=utf-8", obj.toString())
@@ -51,6 +53,18 @@ class BridgeHttpServer(
     override fun serve(session: IHTTPSession): Response {
         val path = session.uri ?: "/"
         val method = session.method
+
+        if (isWebsocketRequested(session)) {
+            if (path != "/ws") return err(Response.Status.NOT_FOUND, "unknown websocket endpoint")
+            // Never accept credentials in a URL or browser-origin requests.
+            if (session.headers["origin"] != null) return err(Response.Status.FORBIDDEN, "browser origin not allowed")
+            val token = session.headers["x-bridge-token"]
+            if (!BridgeState.verifyToken(context, token)) {
+                BridgeState.log("AUTH_FAIL WS /ws")
+                return err(Response.Status.UNAUTHORIZED, "invalid X-Bridge-Token")
+            }
+            return super.serve(session)
+        }
 
         // Unauthenticated local health probe
         if (path == "/health" && method == Method.GET) {
@@ -93,6 +107,170 @@ class BridgeHttpServer(
             BridgeState.log("EXC $method $path: ${t.javaClass.simpleName}: ${t.message}")
             err(Response.Status.INTERNAL_ERROR, "${t.javaClass.simpleName}: ${t.message}")
         }
+    }
+
+    override fun openWebSocket(handshake: IHTTPSession): WebSocket {
+        val token = handshake.headers["x-bridge-token"]
+        return object : WebSocket(handshake) {
+            override fun onOpen() { BridgeState.log("WS connected") }
+            override fun onClose(code: WebSocketFrame.CloseCode, reason: String, initiatedByRemote: Boolean) {
+                BridgeState.log("WS closed")
+            }
+            override fun onPong(pong: WebSocketFrame) {}
+            override fun onException(exception: IOException) { BridgeState.log("WS error: ${exception.javaClass.simpleName}") }
+            override fun onMessage(message: WebSocketFrame) {
+                try {
+                    if (!BridgeState.verifyToken(context, token)) {
+                        close(WebSocketFrame.CloseCode.PolicyViolation, "token revoked", false)
+                        return
+                    }
+                    val text = message.textPayload
+                    require(text.length <= 65536) { "message too large" }
+                    val request = JSONObject(text)
+                    val op = request.optString("op")
+                    val result = when (op) {
+                        "ping" -> JSONObject().put("ok", true).put("pong", true)
+                        "ui_state" -> requireA11y().uiStateJson().put("ok", true)
+                        "batch" -> runBatch(request)
+                        "shot" -> {
+                            val shot = requireA11y().captureScreenshot(
+                                region = null,
+                                maxWidth = request.optInt("max_width", 540).coerceIn(160, 1080),
+                                format = "jpg",
+                                quality = request.optInt("quality", 60).coerceIn(20, 90)
+                            )
+                            JSONObject().put("ok", true).put("mime", shot.mime)
+                                .put("w", shot.outWidth).put("h", shot.outHeight)
+                                .put("b64", Base64.encodeToString(shot.bytes, Base64.NO_WRAP))
+                        }
+                        else -> throw IllegalArgumentException("unknown op")
+                    }
+                    if (request.has("id")) result.put("id", request.get("id"))
+                    BridgeState.incrementRequests()
+                    BridgeState.log("WS $op")
+                    send(result.toString())
+                } catch (e: Exception) {
+                    runCatching { send(JSONObject().put("ok", false).put("error", e.message ?: "request failed").toString()) }
+                }
+            }
+        }
+    }
+
+    private fun runBatch(b: JSONObject): JSONObject {
+            val steps = b.optJSONArray("steps") ?: throw IllegalArgumentException("Missing steps array")
+            require(steps.length() <= 100) { "Maximum 100 batch steps" }
+            val stopOnError = b.optBoolean("stop_on_error", true)
+            val outArr = JSONArray()
+            val tStart = System.currentTimeMillis()
+
+            for (i in 0 until steps.length()) {
+                val st = steps.getJSONObject(i)
+                val op = st.optString("op", "").lowercase()
+                val stStart = System.currentTimeMillis()
+                try {
+                    val stepRes: JSONObject = when (op) {
+                        "click", "tap" -> {
+                            val okTap = requireA11y().tap(
+                                st.getInt("x"),
+                                st.getInt("y"),
+                                st.optLong("duration_ms", 55L)
+                            )
+                            JSONObject().put("ok", okTap)
+                        }
+                        "longpress" -> {
+                            val okLp = requireA11y().longPress(
+                                st.getInt("x"),
+                                st.getInt("y"),
+                                st.optLong("duration_ms", 550L)
+                            )
+                            JSONObject().put("ok", okLp)
+                        }
+                        "swipe" -> {
+                            val okSw = requireA11y().swipe(
+                                st.getInt("x1"), st.getInt("y1"),
+                                st.getInt("x2"), st.getInt("y2"),
+                                st.optLong("duration_ms", 280L)
+                            )
+                            JSONObject().put("ok", okSw)
+                        }
+                        "scroll" -> requireA11y().scrollScreen(st.optInt("dy", -2))
+                        "ui_click" -> requireA11y().uiClick(
+                            ref = if (st.has("ref")) st.optInt("ref") else null,
+                            text = st.optString("text", "").ifEmpty { null },
+                            desc = st.optString("desc", "").ifEmpty { null },
+                            resId = st.optString("id", "").ifEmpty { null },
+                            exact = st.optBoolean("exact", false),
+                            index = st.optInt("index", 0),
+                            longClick = st.optBoolean("long", false)
+                        )
+                        "set_text", "type" -> requireA11y().uiSetText(
+                            value = st.optString("text", ""),
+                            ref = if (st.has("ref")) st.optInt("ref") else null,
+                            target = st.optString("target", "").ifEmpty { null },
+                            resId = st.optString("id", "").ifEmpty { null },
+                            append = st.optBoolean("append", false),
+                            submit = st.optBoolean("submit", false)
+                        )
+                        "key", "keys", "global" -> {
+                            val act = st.optString("action", st.optString("combo", "back"))
+                            JSONObject().put("ok", requireA11y().triggerGlobalAction(act)).put("action", act)
+                        }
+                        "open" -> PhoneController.openTarget(context, st.getString("target"))
+                        "wait" -> requireA11y().uiWait(
+                            text = st.optString("text", "").ifEmpty { null },
+                            desc = st.optString("desc", "").ifEmpty { null },
+                            resId = st.optString("id", "").ifEmpty { null },
+                            gone = st.optBoolean("gone", false),
+                            timeoutMs = st.optLong("timeout_ms", 5000L)
+                        )
+                        "sleep" -> {
+                            val ms = if (st.has("ms")) st.optLong("ms")
+                            else (st.optDouble("s", 0.4) * 1000.0).toLong()
+                            Thread.sleep(ms.coerceIn(10L, 20_000L))
+                            JSONObject().put("ok", true).put("slept_ms", ms)
+                        }
+                        "ui_state" -> requireA11y().uiStateJson().put("ok", true)
+                        "shot" -> {
+                            val shot = requireA11y().captureScreenshot(
+                                region = st.optString("region", "").ifEmpty { null },
+                                maxWidth = st.optInt("max_width", 540).let { if (it > 0) it else null },
+                                format = st.optString("format", "jpg"),
+                                quality = st.optInt("quality", 70)
+                            )
+                            JSONObject().apply {
+                                put("ok", true)
+                                put("mime", shot.mime)
+                                put("bytes", shot.bytes.size)
+                                put("w", shot.outWidth)
+                                put("h", shot.outHeight)
+                                put("b64", Base64.encodeToString(shot.bytes, Base64.NO_WRAP))
+                            }
+                        }
+                        else -> throw IllegalArgumentException("Unknown batch op: $op")
+                    }
+                    stepRes.put("i", i)
+                    stepRes.put("op", op)
+                    stepRes.put("ms", System.currentTimeMillis() - stStart)
+                    outArr.put(stepRes)
+                    if (!stepRes.optBoolean("ok", true) && stopOnError) break
+                } catch (e: Exception) {
+                    outArr.put(JSONObject().apply {
+                        put("i", i)
+                        put("op", op)
+                        put("ok", false)
+                        put("ms", System.currentTimeMillis() - stStart)
+                        put("error", e.message ?: "step failed")
+                    })
+                    if (stopOnError) break
+                }
+            }
+
+            return JSONObject().apply {
+                put("steps", outArr)
+                put("ran", outArr.length())
+                put("of", steps.length())
+                put("ms", System.currentTimeMillis() - tStart)
+            }
     }
 
     private fun dispatch(session: IHTTPSession, method: Method, path: String): Response {
@@ -301,120 +479,7 @@ class BridgeHttpServer(
         }
 
         if (path == "/gui/batch" && method == Method.POST) {
-            val b = readJson(session)
-            val steps = b.optJSONArray("steps") ?: throw IllegalArgumentException("Missing steps array")
-            val stopOnError = b.optBoolean("stop_on_error", true)
-            val outArr = JSONArray()
-            val tStart = System.currentTimeMillis()
-
-            for (i in 0 until steps.length()) {
-                val st = steps.getJSONObject(i)
-                val op = st.optString("op", "").lowercase()
-                val stStart = System.currentTimeMillis()
-                try {
-                    val stepRes: JSONObject = when (op) {
-                        "click", "tap" -> {
-                            val okTap = requireA11y().tap(
-                                st.getInt("x"),
-                                st.getInt("y"),
-                                st.optLong("duration_ms", 55L)
-                            )
-                            JSONObject().put("ok", okTap)
-                        }
-                        "longpress" -> {
-                            val okLp = requireA11y().longPress(
-                                st.getInt("x"),
-                                st.getInt("y"),
-                                st.optLong("duration_ms", 550L)
-                            )
-                            JSONObject().put("ok", okLp)
-                        }
-                        "swipe" -> {
-                            val okSw = requireA11y().swipe(
-                                st.getInt("x1"), st.getInt("y1"),
-                                st.getInt("x2"), st.getInt("y2"),
-                                st.optLong("duration_ms", 280L)
-                            )
-                            JSONObject().put("ok", okSw)
-                        }
-                        "scroll" -> requireA11y().scrollScreen(st.optInt("dy", -2))
-                        "ui_click" -> requireA11y().uiClick(
-                            ref = if (st.has("ref")) st.optInt("ref") else null,
-                            text = st.optString("text", "").ifEmpty { null },
-                            desc = st.optString("desc", "").ifEmpty { null },
-                            resId = st.optString("id", "").ifEmpty { null },
-                            exact = st.optBoolean("exact", false),
-                            index = st.optInt("index", 0),
-                            longClick = st.optBoolean("long", false)
-                        )
-                        "set_text", "type" -> requireA11y().uiSetText(
-                            value = st.optString("text", ""),
-                            ref = if (st.has("ref")) st.optInt("ref") else null,
-                            target = st.optString("target", "").ifEmpty { null },
-                            resId = st.optString("id", "").ifEmpty { null },
-                            append = st.optBoolean("append", false),
-                            submit = st.optBoolean("submit", false)
-                        )
-                        "key", "keys", "global" -> {
-                            val act = st.optString("action", st.optString("combo", "back"))
-                            JSONObject().put("ok", requireA11y().triggerGlobalAction(act)).put("action", act)
-                        }
-                        "open" -> PhoneController.openTarget(context, st.getString("target"))
-                        "wait" -> requireA11y().uiWait(
-                            text = st.optString("text", "").ifEmpty { null },
-                            desc = st.optString("desc", "").ifEmpty { null },
-                            resId = st.optString("id", "").ifEmpty { null },
-                            gone = st.optBoolean("gone", false),
-                            timeoutMs = st.optLong("timeout_ms", 5000L)
-                        )
-                        "sleep" -> {
-                            val ms = if (st.has("ms")) st.optLong("ms")
-                            else (st.optDouble("s", 0.4) * 1000.0).toLong()
-                            Thread.sleep(ms.coerceIn(10L, 20_000L))
-                            JSONObject().put("ok", true).put("slept_ms", ms)
-                        }
-                        "ui_state" -> requireA11y().uiStateJson().put("ok", true)
-                        "shot" -> {
-                            val shot = requireA11y().captureScreenshot(
-                                region = st.optString("region", "").ifEmpty { null },
-                                maxWidth = st.optInt("max_width", 540).let { if (it > 0) it else null },
-                                format = st.optString("format", "jpg"),
-                                quality = st.optInt("quality", 70)
-                            )
-                            JSONObject().apply {
-                                put("ok", true)
-                                put("mime", shot.mime)
-                                put("bytes", shot.bytes.size)
-                                put("w", shot.outWidth)
-                                put("h", shot.outHeight)
-                                put("b64", Base64.encodeToString(shot.bytes, Base64.NO_WRAP))
-                            }
-                        }
-                        else -> throw IllegalArgumentException("Unknown batch op: $op")
-                    }
-                    stepRes.put("i", i)
-                    stepRes.put("op", op)
-                    stepRes.put("ms", System.currentTimeMillis() - stStart)
-                    outArr.put(stepRes)
-                    if (!stepRes.optBoolean("ok", true) && stopOnError) break
-                } catch (e: Exception) {
-                    outArr.put(JSONObject().apply {
-                        put("i", i)
-                        put("op", op)
-                        put("ok", false)
-                        put("ms", System.currentTimeMillis() - stStart)
-                        put("error", e.message ?: "step failed")
-                    })
-                    if (stopOnError) break
-                }
-            }
-
-            return ok(JSONObject().apply {
-                put("steps", outArr)
-                put("ran", outArr.length())
-                put("of", steps.length())
-                put("ms", System.currentTimeMillis() - tStart)
-            })
+            return ok(runBatch(readJson(session)))
         }
 
         // ==============================================================
