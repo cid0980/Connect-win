@@ -1,0 +1,67 @@
+name: Build Android APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout cloudflared
+        uses: actions/checkout@v4
+        with:
+          repository: cloudflare/cloudflared
+          ref: 2026.10.7
+          path: cloudflared-src
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cloudflared-src/go.mod
+          cache: false
+      - name: Build Android tunnel executable
+        run: |
+          cp cloudflared_patch/android_init.go cloudflared-src/cmd/cloudflared/
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cd cloudflared-src
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o ../app/src/main/jniLibs/arm64-v8a/libcloudflared.so ./cmd/cloudflared
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Restore signing key
+        env:
+          KEY: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          test -n "$KEY"
+          echo "$KEY" | base64 --decode > "$RUNNER_TEMP/connectwin.p12"
+      - name: Build signed APK
+        env:
+          SIGNING_KEYSTORE_PATH: ${{ runner.temp }}/connectwin.p12
+          SIGNING_STORE_PASS: ${{ secrets.SIGNING_STORE_PASS }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASS: ${{ secrets.SIGNING_KEY_PASS }}
+        run: |
+          test -n "$SIGNING_STORE_PASS" && test -n "$SIGNING_KEY_ALIAS" && test -n "$SIGNING_KEY_PASS"
+          gradle --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk Connect-win-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Connect-win-arm64
+          path: Connect-win-arm64.apk
+          if-no-files-found: error
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || gh release create latest --title 'Latest build' --notes 'Latest successful build of Connect-win.'
+          gh release upload latest Connect-win-arm64.apk --clobber
+      - name: Delete signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/connectwin.p12"
