@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Connect-win</string>
+    <string name="accessibility_label">Connect-win Bridge Control</string>
+    <string name="accessibility_description">Allows Connect-win to inspect UI elements, perform gestures/taps, and capture screenshots when the bridge is active.</string>
+    <string name="notification_listener_label">Connect-win Notification Bridge</string>
+</resources>

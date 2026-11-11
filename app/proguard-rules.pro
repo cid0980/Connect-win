@@ -1,0 +1,2 @@
+-keep class fi.iki.elonen.** { *; }
+-keep class com.cid0980.connectwin.** { *; }
