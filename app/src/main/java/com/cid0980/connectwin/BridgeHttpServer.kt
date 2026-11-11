@@ -640,6 +640,16 @@ class BridgeHttpServer(
             return ok(PhoneController.mediaControl(context, b.optString("command", "play_pause")))
         }
 
+        // Explicit end-of-task notification: works without the Arena page being visible.
+        // The existing bridge authentication applies; no chat content is accepted or stored.
+        if (path == "/phone/notify-complete" && method == Method.POST) {
+            val enabled = ArenaCompletionMonitor.enabled(context)
+            val posted = enabled && ArenaCompletionMonitor.notify(context, direct = true)
+            return ok(JSONObject().put("ok", posted).put("posted", posted)
+                .put("reason", if (posted) "posted" else if (!enabled) "feature_disabled" else "notifications_disabled_or_post_failed")
+                .put("note", "Sound depends on Android channel, volume and Do Not Disturb settings."))
+        }
+
         if (path == "/phone/vibrate" && method == Method.POST) {
             val b = readJson(session)
             return ok(PhoneController.vibrate(context, b.optLong("ms", 250L)))

@@ -25,7 +25,10 @@ class ArenaCompletionMonitor(private val service: BridgeAccessibilityService) {
         fun setEnabled(context: Context, enabled: Boolean) {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, enabled).apply()
         }
-        fun notify(context: Context, test: Boolean = false): Boolean {
+        @Volatile private var lastDirectNoticeMs = 0L
+        fun notify(context: Context, test: Boolean = false, direct: Boolean = false): Boolean {
+            if (!test && !enabled(context)) return false
+            if (!test && !direct && lastDirectNoticeMs != 0L && SystemClock.elapsedRealtime() - lastDirectNoticeMs < 30_000L) return false
             if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             if (!manager.areNotificationsEnabled()) return false
@@ -36,11 +39,15 @@ class ArenaCompletionMonitor(private val service: BridgeAccessibilityService) {
             val notification = NotificationCompat.Builder(context, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentTitle(if (test) "Connect-win notification test" else "Arena response finished")
-                .setContentText(if (test) "If you hear a sound, notifications are working." else "The response may have finished or stopped. Return to Arena to check.")
+                .setContentText(if (test) "If you hear a sound, notifications are working." else if (direct) "The agent reports its work is complete. Open Arena for details." else "The response may have finished or stopped. Return to Arena to check.")
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(true)
                 .build()
-            return runCatching { manager.notify(1704, notification); true }.getOrDefault(false)
+            return runCatching {
+                manager.notify(1704, notification)
+                if (direct) lastDirectNoticeMs = SystemClock.elapsedRealtime()
+                true
+            }.getOrDefault(false)
         }
     }
 

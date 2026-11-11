@@ -241,7 +241,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
         arenaCard.addView(TextView(this).apply {
-            text = "Best effort: keep the Arena agent page visible in Chrome while it works. Accessibility and notifications must be enabled. The detector reads only the page address and composer controls locally; it does not store chat content. It may miss background/locked pages or alert when generation is stopped or paused. Sound follows Android notification and Do Not Disturb settings."
+            text = "Your agent can send a completion notification directly via the authenticated bridge, even when Arena is not visible. Automatic on-screen detection is best effort and requires the Arena agent page visible in Chrome and accessibility enabled. It reads only the page address and composer controls locally, and may miss or misidentify transitions. Notifications must be enabled; sound follows Android volume, channel and Do Not Disturb settings."
             textSize = 12f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, dp(8), 0, dp(8))
