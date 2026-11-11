@@ -40,7 +40,10 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
         var releasing: Boolean = false,
         var prev: GestureDescription.StrokeDescription? = null,
         var next: GestureDescription.StrokeDescription? = null,
-        val downAt: Long = SystemClock.uptimeMillis()
+        val downAt: Long = SystemClock.uptimeMillis(),
+        // Monotonic per-pointer generation so a delayed "press" release cannot
+        // lift a newer finger that reused the same pointer id.
+        var generation: Long = 0L
     )
 
     private val thread = HandlerThread("cw-touch").apply { start() }
@@ -53,6 +56,13 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
     private var lastCompletedAt = 0L
     private val tickCount = AtomicLong(0)
     private val moveCount = AtomicLong(0)
+    private var generationCounter = 0L
+
+    // Screen size is queried from WindowManager; cache it so a 60 Hz move stream
+    // does not make a binder call per event. Refreshed on down and periodically.
+    private var cachedW = 0
+    private var cachedH = 0
+    private var screenRefreshedAt = 0L
 
     // ------------------------------------------------------------------
     // Public API (thread-safe: posts onto the engine thread)
@@ -61,8 +71,11 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
         handler.post {
             if (pointer !in 0 until MAX_POINTERS) return@post
             if (pointers.size >= MAX_POINTERS && !pointers.containsKey(pointer)) return@post
+            refreshScreen(force = true)
             val (sx, sy) = clamp(x, y)
-            pointers[pointer] = Pointer(sx, sy, sx, sy)
+            val p = Pointer(sx, sy, sx, sy)
+            p.generation = ++generationCounter
+            pointers[pointer] = p
             ensureLoop()
         }
     }
@@ -87,8 +100,25 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
 
     /** Press, hold for [holdMs], then release — a human-like tap/press. */
     fun press(pointer: Int, x: Int, y: Int, holdMs: Long) {
-        down(pointer, x, y)
-        handler.postDelayed({ up(pointer) }, holdMs.coerceIn(20L, 10_000L))
+        handler.post {
+            if (pointer !in 0 until MAX_POINTERS) return@post
+            if (pointers.size >= MAX_POINTERS && !pointers.containsKey(pointer)) return@post
+            refreshScreen(force = true)
+            val (sx, sy) = clamp(x, y)
+            val p = Pointer(sx, sy, sx, sy)
+            p.generation = ++generationCounter
+            pointers[pointer] = p
+            val gen = p.generation
+            ensureLoop()
+            handler.postDelayed({
+                // Only lift if this is still the same finger we pressed.
+                val cur = pointers[pointer]
+                if (cur != null && cur.generation == gen) {
+                    cur.releasing = true
+                    ensureLoop()
+                }
+            }, holdMs.coerceIn(20L, 10_000L))
+        }
     }
 
     fun cancelAll() {
@@ -140,20 +170,25 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
     // ------------------------------------------------------------------
     // Engine loop
     // ------------------------------------------------------------------
-    private fun clamp(x: Int, y: Int): Pair<Float, Float> {
-        val (w, h) = screenSize()
-        return Pair(
-            x.toFloat().coerceIn(0f, (w - 1).toFloat()),
-            y.toFloat().coerceIn(0f, (h - 1).toFloat())
-        )
-    }
-
-    private fun screenSize(): Pair<Int, Int> {
+    private fun refreshScreen(force: Boolean = false) {
+        val now = SystemClock.uptimeMillis()
+        if (!force && cachedW > 0 && now - screenRefreshedAt < 1000L) return
         val wm = service.getSystemService(AccessibilityService.WINDOW_SERVICE) as android.view.WindowManager
         val p = android.graphics.Point()
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealSize(p)
-        return Pair(p.x, p.y)
+        cachedW = p.x; cachedH = p.y
+        screenRefreshedAt = now
+    }
+
+    private fun clamp(x: Int, y: Int): Pair<Float, Float> {
+        refreshScreen()
+        val w = if (cachedW > 0) cachedW else 1080
+        val h = if (cachedH > 0) cachedH else 2400
+        return Pair(
+            x.toFloat().coerceIn(0f, (w - 1).toFloat()),
+            y.toFloat().coerceIn(0f, (h - 1).toFloat())
+        )
     }
 
     private fun ensureLoop() {

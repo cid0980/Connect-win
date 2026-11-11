@@ -6,8 +6,11 @@ import com.cid0980.connectwin.BridgeAccessibilityService
 import com.cid0980.connectwin.BridgeState
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -32,15 +35,27 @@ object ReflexEngine {
         val maxFires: Long,
         @Volatile var enabled: Boolean,
         @Volatile var lastFiredMs: Long = 0L,
-        val fires: AtomicLong = AtomicLong(0)
+        val fires: AtomicLong = AtomicLong(0),
+        // Coalescing: while one action for this rule is still queued/running we do
+        // not queue another, so a noisy rule cannot flood the executor and add lag.
+        val inFlight: AtomicBoolean = AtomicBoolean(false)
     )
 
     private val rules = LinkedHashMap<String, Rule>()
     private val lock = Any()
     @Volatile var enabled: Boolean = false; private set
-    private val executor = Executors.newSingleThreadExecutor()
+    // Bounded queue + abort policy = hard backpressure instead of unbounded lag.
+    // Per-rule coalescing (inFlight) keeps queued tasks <= number of rules, so the
+    // queue rarely fills; if it ever does, execute() throws and we clear inFlight.
+    private val executor = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue<Runnable>(64),
+        { r -> Thread(r, "cw-reflex").apply { isDaemon = true } },
+        ThreadPoolExecutor.AbortPolicy()
+    )
     private val evalCount = AtomicLong(0)
     private val fireCount = AtomicLong(0)
+    private val droppedCount = AtomicLong(0)
 
     // ------------------------------------------------------------------
     // Rule management
@@ -102,6 +117,7 @@ object ReflexEngine {
             put("enabled", enabled)
             put("evaluations", evalCount.get())
             put("fires", fireCount.get())
+            put("coalesced_drops", droppedCount.get())
             put("rules", arr)
         }
     }
@@ -125,11 +141,28 @@ object ReflexEngine {
             }
             evalCount.incrementAndGet()
             if (matched) {
+                // Coalesce: skip if a previous action for this rule is still pending.
+                if (!r.inFlight.compareAndSet(false, true)) {
+                    droppedCount.incrementAndGet()
+                    continue
+                }
                 r.lastFiredMs = now
                 r.fires.incrementAndGet()
                 fireCount.incrementAndGet()
                 val action = r.action
-                executor.execute { runAction(action, r.normalized) }
+                val normalized = r.normalized
+                try {
+                    executor.execute {
+                        try {
+                            runAction(action, normalized)
+                        } finally {
+                            r.inFlight.set(false)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    r.inFlight.set(false)
+                    droppedCount.incrementAndGet()
+                }
             }
         }
     }

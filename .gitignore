@@ -7,3 +7,14 @@ local.properties
 .idea/
 *.keystore
 *.jks
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local build/toolchain
+.cache/
+.gradle/
+build/
+dist/
+out/

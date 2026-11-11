@@ -68,8 +68,20 @@ class BridgeHttpServer(
     private fun physicalScreen(): Pair<Int, Int> =
         BridgeAccessibilityService.instance?.screenSize() ?: Pair(0, 0)
 
+    // Shared single-entry encode cache: when a stream and an on-demand shot (or two
+    // consumers) want the same frame at the same size/quality, encode once and reuse.
+    private val frameCacheLock = Any()
+    private var cachedFrameKey: String? = null
+    private var cachedFrame: FrameResult? = null
+
     private fun grabFrame(maxWidth: Int, quality: Int): FrameResult {
         if (ScreenCaptureService.isRunning()) {
+            val seq = ScreenCaptureService.frameStore.seq
+            val q = quality.coerceIn(10, 95)
+            val key = "$seq:$maxWidth:$q"
+            synchronized(frameCacheLock) {
+                if (cachedFrameKey == key) cachedFrame?.let { return it }
+            }
             val bmp = ScreenCaptureService.frameStore.copy()
             if (bmp != null) {
                 try {
@@ -84,12 +96,13 @@ class BridgeHttpServer(
                         if (scaled !== bmp) work = scaled
                     }
                     val out = ByteArrayOutputStream()
-                    work.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 95), out)
+                    work.compress(Bitmap.CompressFormat.JPEG, q, out)
                     val res = FrameResult(
                         out.toByteArray(), work.width, work.height, origW, origH,
-                        ScreenCaptureService.frameStore.seq, "mediaprojection"
+                        seq, "mediaprojection"
                     )
                     if (work !== bmp) work.recycle()
+                    synchronized(frameCacheLock) { cachedFrameKey = key; cachedFrame = res }
                     return res
                 } finally {
                     if (!bmp.isRecycled) bmp.recycle()
@@ -223,15 +236,31 @@ class BridgeHttpServer(
             private fun handleBinary(data: ByteArray) {
                 val req = BinaryProtocol.decode(data)
                 if (req == null) { sendBinarySafe(BinaryProtocol.encodeTouchAck(255, false)); return }
-                when (req[0]) {
+                val type = req[0]; val a = req[1]; val b = req[2]; val c = req[3]; val seq = req[4]
+                when (type) {
                     0x01 -> {
-                        val f = grabFrame(req[1], req[2])
+                        val f = grabFrame(a, b)
                         sendBinarySafe(BinaryProtocol.encodeFrame(f.seq, f.w, f.h, f.origW, f.origH, f.bytes))
                     }
-                    0x02 -> { requireA11y().touchDown(req[1], req[2], req[3]); sendBinarySafe(BinaryProtocol.encodeTouchAck(req[1], true)) }
-                    0x03 -> { requireA11y().touchMove(req[1], req[2], req[3]) } // no ack: keep move path minimal
-                    0x04 -> { requireA11y().touchUp(req[1]); sendBinarySafe(BinaryProtocol.encodeTouchAck(req[1], true)) }
-                    0x05 -> sendBinarySafe(BinaryProtocol.encodePong(req[1], System.currentTimeMillis()))
+                    0x02 -> { requireA11y().touchDown(a, b, c); sendBinarySafe(BinaryProtocol.encodeTouchAck(a, true)) }
+                    0x03 -> { requireA11y().touchMove(a, b, c) } // no ack: keep move path minimal
+                    0x04 -> { requireA11y().touchUp(a); sendBinarySafe(BinaryProtocol.encodeTouchAck(a, true)) }
+                    0x05 -> sendBinarySafe(BinaryProtocol.encodePong(a, System.currentTimeMillis()))
+                    0x10, 0x11, 0x12 -> { // sequenced touch: always ack in order
+                        val svc = BridgeAccessibilityService.instance
+                        if (svc == null) {
+                            sendBinarySafe(BinaryProtocol.encodeTouchAckSeq(a, seq, BinaryProtocol.ACK_UNAVAILABLE))
+                        } else if (a !in 0 until com.cid0980.connectwin.realtime.ContinuousTouchEngine.MAX_POINTERS) {
+                            sendBinarySafe(BinaryProtocol.encodeTouchAckSeq(a, seq, BinaryProtocol.ACK_INVALID))
+                        } else {
+                            when (type) {
+                                0x10 -> svc.touchDown(a, b, c)
+                                0x11 -> svc.touchMove(a, b, c)
+                                0x12 -> svc.touchUp(a)
+                            }
+                            sendBinarySafe(BinaryProtocol.encodeTouchAckSeq(a, seq, BinaryProtocol.ACK_QUEUED))
+                        }
+                    }
                 }
                 BridgeState.incrementRequests()
             }

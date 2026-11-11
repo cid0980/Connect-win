@@ -112,6 +112,25 @@ class BridgeClient:
         raise ValueError(kind)
 
     @staticmethod
+    def pack_touch_seq(kind, pointer, seq, x=0, y=0):
+        if kind == "down":
+            return struct.pack("<BBHHI", 0x10, pointer, x, y, seq)
+        if kind == "move":
+            return struct.pack("<BBHHI", 0x11, pointer, x, y, seq)
+        if kind == "up":
+            return struct.pack("<BBI", 0x12, pointer, seq)
+        raise ValueError(kind)
+
+    @staticmethod
+    def unpack_ack_seq(data):
+        if isinstance(data, str):
+            data = data.encode("latin-1")
+        if len(data) < 7 or data[0] != 0x90:
+            return None
+        pointer, seq, status = struct.unpack("<BIB", data[1:7])
+        return {"pointer": pointer, "seq": seq, "status": status}
+
+    @staticmethod
     def unpack_frame(data):
         if isinstance(data, str):
             data = data.encode("latin-1")
@@ -178,6 +197,48 @@ def cmd_touch(c, args):
     if args.action == "tick":
         body["tick_ms"] = args.tick_ms
     print(json.dumps(c.http("POST", "/gui/touch", body=body)))
+
+
+def cmd_ws_touch(c, args):
+    """Persistent-WS sequenced touch: every action is confirmed by an ordered ack."""
+    ws = c.ws()
+    seq = 0
+    results = []
+
+    def send(kind, pointer, x=0, y=0):
+        nonlocal seq
+        seq += 1
+        t0 = time.perf_counter()
+        ws.send_binary(c.pack_touch_seq(kind, pointer, seq, x, y))
+        # Read until we get the matching sequenced ack (skip frames/other packets).
+        while True:
+            ack = c.unpack_ack_seq(ws.recv())
+            if ack and ack["seq"] == seq:
+                results.append({"kind": kind, "pointer": pointer, "seq": seq,
+                                "status": ack["status"],
+                                "rtt_ms": round((time.perf_counter() - t0) * 1000, 2)})
+                return
+
+    try:
+        if args.action == "press":
+            send("down", args.pointer, args.x, args.y)
+            time.sleep(args.hold_ms / 1000.0)
+            send("up", args.pointer)
+        elif args.action == "drag":
+            send("down", args.pointer, args.x, args.y)
+            steps = max(1, args.steps)
+            for i in range(1, steps + 1):
+                x = int(args.x + (args.x2 - args.x) * i / steps)
+                y = int(args.y + (args.y2 - args.y) * i / steps)
+                send("move", args.pointer, x, y)
+                if args.step_delay_ms > 0:
+                    time.sleep(args.step_delay_ms / 1000.0)
+            send("up", args.pointer)
+        else:
+            send(args.action, args.pointer, args.x, args.y)
+    finally:
+        ws.close()
+    print(json.dumps({"ok": True, "acks": results}, indent=2))
 
 
 def cmd_reflex(c, args):
@@ -324,6 +385,13 @@ def build_parser():
     sp.add_argument("--y", type=int, default=0); sp.add_argument("--hold-ms", type=int, default=80)
     sp.add_argument("--tick-ms", type=int, default=16)
 
+    sp = sub.add_parser("ws-touch", help="sequenced touch over one persistent WS (ordered acks)")
+    sp.add_argument("action", choices=["down", "move", "up", "press", "drag"])
+    sp.add_argument("--pointer", type=int, default=0); sp.add_argument("--x", type=int, default=0)
+    sp.add_argument("--y", type=int, default=0); sp.add_argument("--x2", type=int, default=0)
+    sp.add_argument("--y2", type=int, default=0); sp.add_argument("--hold-ms", type=int, default=80)
+    sp.add_argument("--steps", type=int, default=20); sp.add_argument("--step-delay-ms", type=int, default=16)
+
     sp = sub.add_parser("reflex")
     sp.add_argument("action", choices=["list", "add", "enable", "clear"])
     sp.add_argument("--rule", help="JSON rule for 'add'"); sp.add_argument("--off", action="store_true")
@@ -342,7 +410,8 @@ def main():
     c = BridgeClient(args.url, args.token)
     fn = {
         "status": cmd_status, "shot": cmd_shot, "pixel": cmd_pixel, "find-color": cmd_find_color,
-        "touch": cmd_touch, "reflex": cmd_reflex, "stream": cmd_stream, "bench": cmd_bench,
+        "touch": cmd_touch, "ws-touch": cmd_ws_touch, "reflex": cmd_reflex,
+        "stream": cmd_stream, "bench": cmd_bench,
     }[args.cmd]
     fn(c, args)
 

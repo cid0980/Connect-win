@@ -54,6 +54,30 @@ WebSocket (JSON): `touch_down` / `touch_move` / `touch_up` / `touch_press` /
 `touch_cancel` / `touch_state` / `touch_tick`.
 Binary (lowest latency): see `BinaryProtocol.kt` — DOWN/MOVE/UP are 2–6 bytes.
 
+### Sequenced touch (v2) — consistent input/output
+Every command carries a sequence number and gets an **ordered ack**, so the agent
+always knows each action was accepted (no fire-and-forget). Use the persistent-WS
+client:
+```bash
+# press-and-release, confirmed by acks
+python agent/connectwin_client.py ws-touch press --x 540 --y 1200 --hold-ms 90
+# smooth drag from (300,1500) to (700,900) in 24 steps, each acked
+python agent/connectwin_client.py ws-touch drag --x 300 --y 1500 --x2 700 --y2 900 --steps 24
+```
+Binary v2 opcodes `0x10/0x11/0x12` (down/move/up) return a `0x90` ack
+`[pointer][seq][status]` (0=queued, 1=invalid, 2=accessibility unavailable).
+
+### v1.4.1 reliability
+- **Press/release race fixed** — a delayed press-release can no longer lift a newer
+  finger that reused the same pointer id (per-pointer generation).
+- **Cached screen size** — a 60 Hz move stream no longer makes a WindowManager call
+  per event.
+- **Reflex backpressure** — per-rule coalescing + a bounded action queue, so a noisy
+  rule drops stale triggers instead of growing latency (`coalesced_drops` in stats).
+- **Shared frame encode cache** — a stream and an on-demand shot reuse one JPEG encode
+  for the same frame/size/quality.
+- **Protocol unit tests** — the binary wire format is covered by JVM tests in CI.
+
 ## On-device reflexes (auto-fight / auto-task)
 Rules use **normalized 0..1 coordinates** by default so they survive resolution changes.
 ```bash
