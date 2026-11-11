@@ -4,9 +4,11 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Bitmap
 import android.graphics.Path
+import android.graphics.Point
 import android.graphics.Rect
 import android.os.Bundle
 import android.view.Display
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -106,9 +108,14 @@ class BridgeAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    @Suppress("DEPRECATION")
     fun screenSize(): Pair<Int, Int> {
-        val dm = resources.displayMetrics
-        return Pair(dm.widthPixels, dm.heightPixels)
+        // Accessibility bounds and screenshots are in physical display coordinates,
+        // including system bars, rather than the application window's metrics.
+        val point = Point()
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        wm.defaultDisplay.getRealSize(point)
+        return Pair(point.x, point.y)
     }
 
     // ==================================================================
@@ -120,13 +127,16 @@ class BridgeAccessibilityService : AccessibilityService() {
             val winList = windows
             if (!winList.isNullOrEmpty()) {
                 // Sort active/application windows first, system overlays included
-                val sorted = winList.sortedByDescending {
-                    (if (it.isActive) 10 else 0) +
-                        (if (it.type == AccessibilityWindowInfo.TYPE_APPLICATION) 5 else 0) +
-                        it.layer
-                }
+                val sorted = winList.sortedWith(
+                    compareByDescending<AccessibilityWindowInfo> { it.isActive }
+                        .thenByDescending { it.isFocused }
+                        .thenByDescending { it.layer }
+                )
                 for (w in sorted) {
-                    w.root?.let { roots.add(it) }
+                    w.root?.let { root ->
+                        runCatching { root.refresh() }
+                        roots.add(root)
+                    }
                 }
             }
         }
@@ -193,7 +203,7 @@ class BridgeAccessibilityService : AccessibilityService() {
         return out
     }
 
-    fun uiStateJson(): JSONObject {
+    fun uiStateJson(full: Boolean = false): JSONObject {
         val nodes = collectNodes(false)
         val (w, h) = screenSize()
         val fgPkg = nodes.firstOrNull { it.pkg.isNotBlank() && it.pkg != "com.android.systemui" }?.pkg
@@ -210,7 +220,7 @@ class BridgeAccessibilityService : AccessibilityService() {
                 n.text.isNotEmpty() -> n.text
                 n.desc.isNotEmpty() -> n.desc
                 else -> n.id
-            }.take(90)
+            }.take(if (full) 4096 else 90)
 
             if (n.editable) {
                 inputs.put(JSONObject().apply {
@@ -222,7 +232,7 @@ class BridgeAccessibilityService : AccessibilityService() {
                 })
             } else if (n.clickable) {
                 val dedupKey = "$label@${n.cx / 24},${n.cy / 24}"
-                if (label.isNotEmpty() && seenBtn.add(dedupKey) && buttons.length() < 45) {
+                if (label.isNotEmpty() && seenBtn.add(dedupKey) && buttons.length() < (if (full) 150 else 45)) {
                     buttons.put(JSONObject().apply {
                         put("ref", n.ref)
                         put("label", label)
@@ -230,7 +240,7 @@ class BridgeAccessibilityService : AccessibilityService() {
                         put("center", JSONArray(listOf(n.cx, n.cy)))
                     })
                 }
-            } else if (n.text.isNotEmpty() && seenTxt.add(label) && texts.length() < 40) {
+            } else if (n.text.isNotEmpty() && seenTxt.add(label) && texts.length() < (if (full) 150 else 40)) {
                 texts.put(label)
             }
         }
@@ -239,6 +249,7 @@ class BridgeAccessibilityService : AccessibilityService() {
             put("foreground_package", fgPkg)
             put("foreground_activity", currentActivity)
             put("screen", JSONArray(listOf(w, h)))
+            put("coordinate_space", "physical_display_pixels")
             put("total_nodes", nodes.size)
             put("texts", texts)
             put("buttons", buttons)
@@ -267,10 +278,16 @@ class BridgeAccessibilityService : AccessibilityService() {
         index: Int = 0,
         preferEditable: Boolean = false
     ): List<ParsedNode> {
-        val pool = if (ref != null && lastNodes.isNotEmpty()) lastNodes else collectNodes(true)
         if (ref != null) {
-            val hit = pool.filter { it.ref == ref }
-            if (hit.isNotEmpty()) return hit
+            // Re-identify a snapshot reference against fresh nodes; never silently
+            // apply an old numeric ref to a different node after a screen change.
+            val previous = lastNodes.firstOrNull { it.ref == ref } ?: return emptyList()
+            val freshNodes = collectNodes(true)
+            return freshNodes.filter { n ->
+                n.pkg == previous.pkg && n.cls == previous.cls && n.id == previous.id &&
+                    n.text == previous.text && n.desc == previous.desc &&
+                    kotlin.math.abs(n.cx - previous.cx) <= 8 && kotlin.math.abs(n.cy - previous.cy) <= 8
+            }.takeIf { it.size == 1 } ?: emptyList()
         }
 
         fun matchesStr(actual: String, query: String): Boolean {
@@ -279,7 +296,7 @@ class BridgeAccessibilityService : AccessibilityService() {
             else actual.contains(query, ignoreCase = true)
         }
 
-        val fresh = if (pool === lastNodes) collectNodes(true) else pool
+        val fresh = collectNodes(true)
         val filtered = fresh.filter { n ->
             val okText = text.isNullOrEmpty() || matchesStr(n.text, text) || matchesStr(n.desc, text)
             val okDesc = desc.isNullOrEmpty() || matchesStr(n.desc, desc)
@@ -319,8 +336,12 @@ class BridgeAccessibilityService : AccessibilityService() {
         resId: String? = null,
         exact: Boolean = false,
         index: Int = 0,
-        longClick: Boolean = false
+        longClick: Boolean = false,
+        method: String = "auto",
+        expectText: String? = null,
+        expectTimeoutMs: Long = 3000L
     ): JSONObject {
+        require(method == "auto" || method == "gesture" || method == "accessibility") { "Unknown click method" }
         val matches = matchNode(ref = ref, text = text, desc = desc, resId = resId, exact = exact)
         if (matches.isEmpty()) {
             val visible = JSONArray()
@@ -329,19 +350,27 @@ class BridgeAccessibilityService : AccessibilityService() {
             }.distinct().take(25).forEach { visible.put(it) }
             return JSONObject().apply {
                 put("ok", false)
-                put("error", "not_found")
+                put("error", if (ref != null) "stale_or_ambiguous_ref" else "not_found")
                 put("visible_labels", visible)
             }
         }
         val chosen = matches[index.coerceIn(0, matches.size - 1)]
-        val viaAction = performClickableNodeOrParent(chosen.rawNode, longClick)
-        val viaGesture = if (!viaAction) {
+        val viaAction = method != "gesture" && performClickableNodeOrParent(chosen.rawNode, longClick)
+        val viaGesture = if (!viaAction && method != "accessibility") {
             if (longClick) longPress(chosen.cx, chosen.cy, 550) else tap(chosen.cx, chosen.cy, 55)
-        } else true
+        } else false
+        val accepted = viaAction || viaGesture
+        val verification = if (accepted && !expectText.isNullOrBlank()) {
+            uiWait(text = expectText, timeoutMs = expectTimeoutMs)
+        } else null
 
         return JSONObject().apply {
-            put("ok", viaAction || viaGesture)
-            put("method", if (viaAction) "accessibility_action" else "gesture_tap")
+            put("ok", accepted && (verification?.optBoolean("ok") ?: true))
+            put("accepted", accepted)
+            put("verified", verification?.optBoolean("ok") ?: false)
+            put("verification_requested", verification != null)
+            if (verification != null) put("verification", verification)
+            put("method", if (viaAction) "accessibility_action" else if (viaGesture) "gesture_tap" else "none")
             put("clicked_center", JSONArray(listOf(chosen.cx, chosen.cy)))
             put("matched", chosen.toJson())
         }
@@ -358,7 +387,10 @@ class BridgeAccessibilityService : AccessibilityService() {
         var chosen: ParsedNode? = null
         if (ref != null || !target.isNullOrEmpty() || !resId.isNullOrEmpty()) {
             val matches = matchNode(ref = ref, text = target, resId = resId, preferEditable = true)
-            chosen = matches.firstOrNull()
+            chosen = matches.firstOrNull { it.editable }
+            if (chosen == null) {
+                return JSONObject().put("ok", false).put("error", if (ref != null) "stale_or_ambiguous_ref" else "target_not_found")
+            }
         }
         if (chosen == null) {
             val all = collectNodes(true)

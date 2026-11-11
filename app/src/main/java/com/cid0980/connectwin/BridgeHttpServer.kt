@@ -130,7 +130,7 @@ class BridgeHttpServer(
                     val op = request.optString("op")
                     val result = when (op) {
                         "ping" -> JSONObject().put("ok", true).put("pong", true)
-                        "ui_state" -> requireA11y().uiStateJson().put("ok", true)
+                        "ui_state" -> requireA11y().uiStateJson(request.optBoolean("full", false)).put("ok", true)
                         "batch" -> runBatch(request)
                         "shot" -> {
                             val shot = requireA11y().captureScreenshot(
@@ -205,7 +205,10 @@ class BridgeHttpServer(
                             resId = st.optString("id", "").ifEmpty { null },
                             exact = st.optBoolean("exact", false),
                             index = st.optInt("index", 0),
-                            longClick = st.optBoolean("long", false)
+                            longClick = st.optBoolean("long", false),
+                            method = st.optString("method", "auto"),
+                            expectText = st.optString("expect_text", "").ifEmpty { null },
+                            expectTimeoutMs = st.optLong("expect_timeout_ms", 3000)
                         )
                         "set_text", "type" -> requireA11y().uiSetText(
                             value = st.optString("text", ""),
@@ -358,7 +361,7 @@ class BridgeHttpServer(
         // 3. UI ACCESSIBILITY DOM (/ui/state, /ui/tree, /ui/click, /ui/set-text, /ui/wait)
         // ==============================================================
         if (path == "/ui/state" && method == Method.GET) {
-            return ok(requireA11y().uiStateJson())
+            return ok(requireA11y().uiStateJson(q(session, "full") == "true"))
         }
 
         if (path == "/ui/tree" && method == Method.GET) {
@@ -376,7 +379,10 @@ class BridgeHttpServer(
                     resId = b.optString("id", "").ifEmpty { null },
                     exact = b.optBoolean("exact", false),
                     index = b.optInt("index", 0),
-                    longClick = b.optBoolean("long", false)
+                    longClick = b.optBoolean("long", false),
+                    method = b.optString("method", "auto"),
+                    expectText = b.optString("expect_text", "").ifEmpty { null },
+                    expectTimeoutMs = b.optLong("expect_timeout_ms", 3000)
                 )
             )
         }
