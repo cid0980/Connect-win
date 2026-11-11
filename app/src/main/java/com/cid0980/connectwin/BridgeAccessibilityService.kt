@@ -457,6 +457,28 @@ class BridgeAccessibilityService : AccessibilityService() {
         return completed
     }
 
+    // One bounded Android gesture can include overlapping taps and swipes.
+    fun timedGesture(strokes: org.json.JSONArray): Boolean {
+        require(strokes.length() in 1..10) { "Provide 1 to 10 strokes" }
+        val builder = GestureDescription.Builder()
+        for (i in 0 until strokes.length()) {
+            val s = strokes.getJSONObject(i)
+            val start = s.optLong("start_ms", 0)
+            val duration = s.optLong("duration_ms", 60)
+            require(start in 0..9950 && duration in 20..5000 && start + duration <= 10000) {
+                "Stroke timing must fit within 10 seconds"
+            }
+            val x = s.getInt("x")
+            val y = s.getInt("y")
+            val path = Path().apply {
+                moveTo(x.toFloat(), y.toFloat())
+                if (s.has("x2") && s.has("y2")) lineTo(s.getInt("x2").toFloat(), s.getInt("y2").toFloat())
+            }
+            builder.addStroke(GestureDescription.StrokeDescription(path, start, duration))
+        }
+        return dispatchGestureSync(builder.build(), 12000L)
+    }
+
     fun tap(x: Int, y: Int, durationMs: Long = 55L): Boolean {
         val p = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val stroke = GestureDescription.StrokeDescription(p, 0L, durationMs.coerceIn(20L, 2000L))

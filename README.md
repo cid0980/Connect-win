@@ -68,3 +68,5 @@ curl -s -X POST "$U/gui/batch" -H "$H" -H "Content-Type: application/json" -d '{
 ## Experimental persistent control
 
 The authenticated WebSocket endpoint `/ws` accepts an `X-Bridge-Token` header; browser-origin connections and URL tokens are rejected. It offers JSON operations `ping`, `ui_state`, `shot` (JPEG, base64), and `batch` using the same ordered steps as `/gui/batch` (maximum 100). A token rotation invalidates subsequent commands on existing sockets. Example client: `agent/fast_bridge.py` (requires `websocket-client`). Use only on a trusted device and do not share the token. Screenshots are on-demand, not a video stream. Continuous real-time play and latency improvements have not yet been verified on a device.
+
+A `timed_gesture` batch step accepts up to 10 strokes with `x`, `y`, optional `x2`, `y2`, `start_ms` and `duration_ms`. Strokes may overlap, and the whole gesture is limited to 10 seconds. Android or the target app may cancel gestures; verify outcomes before using them in a longer sequence.

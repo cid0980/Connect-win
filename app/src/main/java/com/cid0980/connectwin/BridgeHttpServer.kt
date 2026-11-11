@@ -177,6 +177,10 @@ class BridgeHttpServer(
                             )
                             JSONObject().put("ok", okTap)
                         }
+                        "timed_gesture" -> {
+                            val strokes = st.optJSONArray("strokes") ?: throw IllegalArgumentException("Missing strokes")
+                            JSONObject().put("ok", requireA11y().timedGesture(strokes))
+                        }
                         "longpress" -> {
                             val okLp = requireA11y().longPress(
                                 st.getInt("x"),
