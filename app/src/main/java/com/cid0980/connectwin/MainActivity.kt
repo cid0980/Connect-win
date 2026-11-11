@@ -50,6 +50,18 @@ class MainActivity : AppCompatActivity() {
         refreshPermissionsUi()
     }
 
+    private val captureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == RESULT_OK && data != null) {
+            com.cid0980.connectwin.realtime.ScreenCaptureService.start(this, result.resultCode, data, 720, 30)
+            Toast.makeText(this, "Fast capture enabled", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Screen capture consent denied", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         BridgeState.init(this)
@@ -256,6 +268,35 @@ class MainActivity : AppCompatActivity() {
             }
         })
         root.addView(arenaCard)
+
+        // Realtime fast-capture card (MediaProjection) for games / low-latency control.
+        val captureCard = makeCard(Color.parseColor("#22D3EE"))
+        captureCard.addView(TextView(this).apply {
+            text = "Realtime fast capture"
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#F8FAFC"))
+        })
+        captureCard.addView(TextView(this).apply {
+            text = "One-time screen-share consent unlocks a high-frame-rate feed (no 3 fps screenshot limit). Required for smooth game vision, live streaming and on-device reflexes. A persistent notification shows while capture is active."
+            textSize = 12f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(6), 0, dp(10))
+        })
+        captureCard.addView(makeButton("Enable fast capture", "#22D3EE") {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+            captureLauncher.launch(mpm.createScreenCaptureIntent())
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        })
+        captureCard.addView(makeButton("Stop fast capture", "#334155", "#F8FAFC") {
+            com.cid0980.connectwin.realtime.ScreenCaptureService.stop(this)
+            Toast.makeText(this, "Fast capture stopped", Toast.LENGTH_SHORT).show()
+        })
+        root.addView(captureCard)
 
         // 2. Android 13-16 Restricted Settings Helper Card
         if (Build.VERSION.SDK_INT >= 33) {

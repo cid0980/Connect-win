@@ -1,13 +1,19 @@
 package com.cid0980.connectwin
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.util.Base64
+import com.cid0980.connectwin.realtime.BinaryProtocol
+import com.cid0980.connectwin.realtime.ReflexEngine
+import com.cid0980.connectwin.realtime.ScreenCaptureService
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoWSD
 import java.io.IOException
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 
@@ -49,6 +55,60 @@ class BridgeHttpServer(
     private fun requireNotifs(): BridgeNotificationService =
         BridgeNotificationService.instance
             ?: throw IllegalStateException("NotificationListener not enabled. Grant Notification Access in Connect-win.")
+
+    // ------------------------------------------------------------------
+    // Fast frame acquisition: prefer the MediaProjection frame store (no rate
+    // limit) and fall back to the accessibility screenshot when capture is off.
+    // ------------------------------------------------------------------
+    private data class FrameResult(
+        val bytes: ByteArray, val w: Int, val h: Int,
+        val origW: Int, val origH: Int, val seq: Long, val source: String
+    )
+
+    private fun physicalScreen(): Pair<Int, Int> =
+        BridgeAccessibilityService.instance?.screenSize() ?: Pair(0, 0)
+
+    private fun grabFrame(maxWidth: Int, quality: Int): FrameResult {
+        if (ScreenCaptureService.isRunning()) {
+            val bmp = ScreenCaptureService.frameStore.copy()
+            if (bmp != null) {
+                try {
+                    val (pw, ph) = physicalScreen()
+                    val origW = if (pw > 0) pw else bmp.width
+                    val origH = if (ph > 0) ph else bmp.height
+                    var work = bmp
+                    if (maxWidth in 1 until bmp.width) {
+                        val ratio = maxWidth.toFloat() / bmp.width
+                        val th = (bmp.height * ratio).toInt().coerceAtLeast(1)
+                        val scaled = Bitmap.createScaledBitmap(bmp, maxWidth, th, true)
+                        if (scaled !== bmp) work = scaled
+                    }
+                    val out = ByteArrayOutputStream()
+                    work.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 95), out)
+                    val res = FrameResult(
+                        out.toByteArray(), work.width, work.height, origW, origH,
+                        ScreenCaptureService.frameStore.seq, "mediaprojection"
+                    )
+                    if (work !== bmp) work.recycle()
+                    return res
+                } finally {
+                    if (!bmp.isRecycled) bmp.recycle()
+                }
+            }
+        }
+        val shot = requireA11y().captureScreenshot(null, if (maxWidth > 0) maxWidth else null, "jpg", quality)
+        return FrameResult(shot.bytes, shot.outWidth, shot.outHeight, shot.origWidth, shot.origHeight, -1L, "accessibility")
+    }
+
+    private fun captureStatusJson(): JSONObject = JSONObject().apply {
+        put("ok", true)
+        put("running", ScreenCaptureService.isRunning())
+        put("seq", ScreenCaptureService.frameStore.seq)
+        put("width", ScreenCaptureService.frameStore.width)
+        put("height", ScreenCaptureService.frameStore.height)
+        put("frame_age_ms", ScreenCaptureService.frameStore.ageMs())
+        put("source", if (ScreenCaptureService.isRunning()) "mediaprojection" else "accessibility")
+    }
 
     override fun serve(session: IHTTPSession): Response {
         val path = session.uri ?: "/"
@@ -112,16 +172,78 @@ class BridgeHttpServer(
     override fun openWebSocket(handshake: IHTTPSession): WebSocket {
         val token = handshake.headers["x-bridge-token"]
         return object : WebSocket(handshake) {
+            private val sendLock = Any()
+            @Volatile private var streaming = false
+            private var streamThread: Thread? = null
+
             override fun onOpen() { BridgeState.log("WS connected") }
             override fun onClose(code: WebSocketFrame.CloseCode, reason: String, initiatedByRemote: Boolean) {
+                stopStream()
+                runCatching { BridgeAccessibilityService.instance?.touchCancelAll() }
                 BridgeState.log("WS closed")
             }
             override fun onPong(pong: WebSocketFrame) {}
-            override fun onException(exception: IOException) { BridgeState.log("WS error: ${exception.javaClass.simpleName}") }
+            override fun onException(exception: IOException) {
+                stopStream()
+                BridgeState.log("WS error: ${exception.javaClass.simpleName}")
+            }
+
+            private fun sendTextSafe(s: String) { synchronized(sendLock) { runCatching { send(s) } } }
+            private fun sendBinarySafe(b: ByteArray) { synchronized(sendLock) { runCatching { send(b) } } }
+
+            private fun stopStream() {
+                streaming = false
+                streamThread?.interrupt()
+                streamThread = null
+            }
+
+            private fun startStream(fps: Int, maxW: Int, q: Int) {
+                stopStream()
+                streaming = true
+                streamThread = Thread {
+                    val interval = 1000L / fps
+                    var lastSeq = -1L
+                    while (streaming && isOpen) {
+                        val t0 = System.currentTimeMillis()
+                        try {
+                            val f = grabFrame(maxW, q)
+                            if (f.source != "mediaprojection" || f.seq != lastSeq) {
+                                lastSeq = f.seq
+                                sendBinarySafe(BinaryProtocol.encodeFrame(f.seq, f.w, f.h, f.origW, f.origH, f.bytes))
+                            }
+                        } catch (e: Exception) {
+                            runCatching { Thread.sleep(100) }
+                        }
+                        val sleep = interval - (System.currentTimeMillis() - t0)
+                        if (sleep > 0) runCatching { Thread.sleep(sleep) }
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+
+            private fun handleBinary(data: ByteArray) {
+                val req = BinaryProtocol.decode(data)
+                if (req == null) { sendBinarySafe(BinaryProtocol.encodeTouchAck(255, false)); return }
+                when (req[0]) {
+                    0x01 -> {
+                        val f = grabFrame(req[1], req[2])
+                        sendBinarySafe(BinaryProtocol.encodeFrame(f.seq, f.w, f.h, f.origW, f.origH, f.bytes))
+                    }
+                    0x02 -> { requireA11y().touchDown(req[1], req[2], req[3]); sendBinarySafe(BinaryProtocol.encodeTouchAck(req[1], true)) }
+                    0x03 -> { requireA11y().touchMove(req[1], req[2], req[3]) } // no ack: keep move path minimal
+                    0x04 -> { requireA11y().touchUp(req[1]); sendBinarySafe(BinaryProtocol.encodeTouchAck(req[1], true)) }
+                    0x05 -> sendBinarySafe(BinaryProtocol.encodePong(req[1], System.currentTimeMillis()))
+                }
+                BridgeState.incrementRequests()
+            }
+
             override fun onMessage(message: WebSocketFrame) {
                 try {
                     if (!BridgeState.verifyToken(context, token)) {
                         close(WebSocketFrame.CloseCode.PolicyViolation, "token revoked", false)
+                        return
+                    }
+                    if (message.opCode == WebSocketFrame.OpCode.Binary) {
+                        handleBinary(message.binaryPayload)
                         return
                     }
                     val text = message.textPayload
@@ -129,28 +251,45 @@ class BridgeHttpServer(
                     val request = JSONObject(text)
                     val op = request.optString("op")
                     val result = when (op) {
-                        "ping" -> JSONObject().put("ok", true).put("pong", true)
+                        "ping" -> JSONObject().put("ok", true).put("pong", true).put("t", System.currentTimeMillis())
                         "ui_state" -> requireA11y().uiStateJson(request.optBoolean("full", false)).put("ok", true)
                         "batch" -> runBatch(request)
                         "shot" -> {
-                            val shot = requireA11y().captureScreenshot(
-                                region = null,
-                                maxWidth = request.optInt("max_width", 540).coerceIn(160, 1080),
-                                format = "jpg",
-                                quality = request.optInt("quality", 60).coerceIn(20, 90)
+                            val f = grabFrame(
+                                request.optInt("max_width", 540).coerceIn(160, 1080),
+                                request.optInt("quality", 60).coerceIn(20, 90)
                             )
-                            JSONObject().put("ok", true).put("mime", shot.mime)
-                                .put("w", shot.outWidth).put("h", shot.outHeight)
-                                .put("b64", Base64.encodeToString(shot.bytes, Base64.NO_WRAP))
+                            JSONObject().put("ok", true).put("mime", "image/jpeg")
+                                .put("w", f.w).put("h", f.h).put("source", f.source)
+                                .put("b64", Base64.encodeToString(f.bytes, Base64.NO_WRAP))
                         }
+                        "touch_down" -> { requireA11y().touchDown(request.optInt("pointer", 0), request.getInt("x"), request.getInt("y")); JSONObject().put("ok", true) }
+                        "touch_move" -> { requireA11y().touchMove(request.optInt("pointer", 0), request.getInt("x"), request.getInt("y")); JSONObject().put("ok", true) }
+                        "touch_up" -> { requireA11y().touchUp(request.optInt("pointer", 0)); JSONObject().put("ok", true) }
+                        "touch_press" -> { requireA11y().touchPress(request.optInt("pointer", 0), request.getInt("x"), request.getInt("y"), request.optLong("hold_ms", 80)); JSONObject().put("ok", true) }
+                        "touch_cancel" -> { requireA11y().touchCancelAll(); JSONObject().put("ok", true) }
+                        "touch_state" -> requireA11y().touchState()
+                        "touch_tick" -> { requireA11y().setTouchTickMs(request.optLong("tick_ms", 16)); JSONObject().put("ok", true) }
+                        "stream_start" -> {
+                            val fps = request.optInt("fps", 15).coerceIn(1, 30)
+                            startStream(fps, request.optInt("max_width", 480).coerceIn(160, 1080), request.optInt("quality", 55).coerceIn(20, 90))
+                            JSONObject().put("ok", true).put("streaming", true).put("fps", fps)
+                                .put("capture_running", ScreenCaptureService.isRunning())
+                        }
+                        "stream_stop" -> { stopStream(); JSONObject().put("ok", true).put("streaming", false) }
+                        "capture_status" -> captureStatusJson()
+                        "reflex_list" -> ReflexEngine.listJson()
+                        "reflex_add" -> ReflexEngine.addRule(request.optJSONObject("rule") ?: request)
+                        "reflex_remove" -> JSONObject().put("ok", ReflexEngine.removeRule(request.optString("id")))
+                        "reflex_enable" -> { ReflexEngine.setEnabled(request.optBoolean("enabled", true)); JSONObject().put("ok", true) }
                         else -> throw IllegalArgumentException("unknown op")
                     }
                     if (request.has("id")) result.put("id", request.get("id"))
                     BridgeState.incrementRequests()
                     BridgeState.log("WS $op")
-                    send(result.toString())
+                    sendTextSafe(result.toString())
                 } catch (e: Exception) {
-                    runCatching { send(JSONObject().put("ok", false).put("error", e.message ?: "request failed").toString()) }
+                    sendTextSafe(JSONObject().put("ok", false).put("error", e.message ?: "request failed").toString())
                 }
             }
         }
@@ -237,20 +376,39 @@ class BridgeHttpServer(
                             JSONObject().put("ok", true).put("slept_ms", ms)
                         }
                         "ui_state" -> requireA11y().uiStateJson().put("ok", true)
+                        "touch" -> {
+                            val a11y = requireA11y()
+                            val p = st.optInt("pointer", 0)
+                            when (st.optString("action", "press")) {
+                                "down" -> a11y.touchDown(p, st.getInt("x"), st.getInt("y"))
+                                "move" -> a11y.touchMove(p, st.getInt("x"), st.getInt("y"))
+                                "up" -> a11y.touchUp(p)
+                                "cancel" -> a11y.touchCancelAll()
+                                else -> a11y.touchPress(p, st.getInt("x"), st.getInt("y"), st.optLong("hold_ms", 80L))
+                            }
+                            JSONObject().put("ok", true)
+                        }
                         "shot" -> {
-                            val shot = requireA11y().captureScreenshot(
-                                region = st.optString("region", "").ifEmpty { null },
-                                maxWidth = st.optInt("max_width", 540).let { if (it > 0) it else null },
-                                format = st.optString("format", "jpg"),
-                                quality = st.optInt("quality", 70)
-                            )
-                            JSONObject().apply {
-                                put("ok", true)
-                                put("mime", shot.mime)
-                                put("bytes", shot.bytes.size)
-                                put("w", shot.outWidth)
-                                put("h", shot.outHeight)
-                                put("b64", Base64.encodeToString(shot.bytes, Base64.NO_WRAP))
+                            val region = st.optString("region", "").ifEmpty { null }
+                            if (region == null) {
+                                val f = grabFrame(st.optInt("max_width", 540), st.optInt("quality", 70))
+                                JSONObject().apply {
+                                    put("ok", true); put("mime", "image/jpeg"); put("bytes", f.bytes.size)
+                                    put("w", f.w); put("h", f.h); put("source", f.source)
+                                    put("b64", Base64.encodeToString(f.bytes, Base64.NO_WRAP))
+                                }
+                            } else {
+                                val shot = requireA11y().captureScreenshot(
+                                    region = region,
+                                    maxWidth = st.optInt("max_width", 540).let { if (it > 0) it else null },
+                                    format = st.optString("format", "jpg"),
+                                    quality = st.optInt("quality", 70)
+                                )
+                                JSONObject().apply {
+                                    put("ok", true); put("mime", shot.mime); put("bytes", shot.bytes.size)
+                                    put("w", shot.outWidth); put("h", shot.outHeight)
+                                    put("b64", Base64.encodeToString(shot.bytes, Base64.NO_WRAP))
+                                }
                             }
                         }
                         else -> throw IllegalArgumentException("Unknown batch op: $op")
@@ -749,6 +907,137 @@ class BridgeHttpServer(
             return ok(PhoneController.pollJob(jid, offset))
         }
 
+        // ==============================================================
+        // 10. REALTIME: continuous touch, fast capture, on-device reflexes
+        // ==============================================================
+        if (path == "/gui/touch" && method == Method.POST) {
+            val b = readJson(session)
+            val a11y = requireA11y()
+            val action = b.optString("action", "state")
+            val pointer = b.optInt("pointer", 0)
+            when (action) {
+                "down" -> a11y.touchDown(pointer, b.getInt("x"), b.getInt("y"))
+                "move" -> a11y.touchMove(pointer, b.getInt("x"), b.getInt("y"))
+                "up" -> a11y.touchUp(pointer)
+                "press" -> a11y.touchPress(pointer, b.getInt("x"), b.getInt("y"), b.optLong("hold_ms", 80L))
+                "cancel" -> a11y.touchCancelAll()
+                "tick" -> a11y.setTouchTickMs(b.optLong("tick_ms", 16L))
+                "state" -> {}
+                else -> throw IllegalArgumentException("unknown touch action: $action")
+            }
+            return ok(a11y.touchState().put("action", action))
+        }
+
+        if (path == "/bench/ping" && method == Method.GET) {
+            return ok(JSONObject().put("ok", true).put("t", System.currentTimeMillis()))
+        }
+
+        if (path == "/capture/status" && method == Method.GET) {
+            return ok(captureStatusJson())
+        }
+
+        if (path == "/capture/start" && method == Method.POST) {
+            return ok(JSONObject().put("ok", ScreenCaptureService.isRunning())
+                .put("running", ScreenCaptureService.isRunning())
+                .put("note", "MediaProjection needs one-time on-device consent. Tap 'Enable fast capture' in the Connect-win app."))
+        }
+
+        if (path == "/capture/stop" && method == Method.POST) {
+            ScreenCaptureService.stop(context)
+            return ok(JSONObject().put("ok", true).put("running", false))
+        }
+
+        if (path == "/capture/frame" && method == Method.GET) {
+            val f = grabFrame(
+                q(session, "max_width")?.toIntOrNull() ?: 720,
+                q(session, "quality")?.toIntOrNull() ?: 70
+            )
+            return newFixedLengthResponse(Response.Status.OK, "image/jpeg", ByteArrayInputStream(f.bytes), f.bytes.size.toLong())
+        }
+
+        if (path == "/capture/pixel" && method == Method.GET) {
+            val nx = q(session, "x")?.toDoubleOrNull() ?: 0.5
+            val ny = q(session, "y")?.toDoubleOrNull() ?: 0.5
+            val normalized = q(session, "normalized") != "false"
+            val pixel = ScreenCaptureService.frameStore.use { bmp ->
+                val px = (if (normalized) nx * bmp.width else nx).toInt().coerceIn(0, bmp.width - 1)
+                val py = (if (normalized) ny * bmp.height else ny).toInt().coerceIn(0, bmp.height - 1)
+                bmp.getPixel(px, py)
+            }
+            return ok(JSONObject().apply {
+                put("ok", pixel != null)
+                if (pixel != null) {
+                    put("r", Color.red(pixel)); put("g", Color.green(pixel)); put("b", Color.blue(pixel))
+                    put("hex", String.format("#%06X", 0xFFFFFF and pixel))
+                } else put("error", "no frame — enable fast capture first")
+            })
+        }
+
+        if (path == "/capture/find_color" && method == Method.POST) {
+            val b = readJson(session)
+            val target = parseColorArg(b.opt("color"))
+                ?: throw IllegalArgumentException("provide color as #RRGGBB or [r,g,b]")
+            val tol = b.optInt("tolerance", 24).coerceIn(0, 255)
+            val found = ScreenCaptureService.frameStore.use { bmp ->
+                val stride = (bmp.width / 160).coerceAtLeast(1)
+                var minX = Int.MAX_VALUE; var minY = Int.MAX_VALUE; var maxX = -1; var maxY = -1
+                var count = 0; var sx = 0L; var sy = 0L
+                var yy = 0
+                while (yy < bmp.height) {
+                    var xx = 0
+                    while (xx < bmp.width) {
+                        val p = bmp.getPixel(xx, yy)
+                        if (kotlin.math.abs(Color.red(p) - Color.red(target)) <= tol &&
+                            kotlin.math.abs(Color.green(p) - Color.green(target)) <= tol &&
+                            kotlin.math.abs(Color.blue(p) - Color.blue(target)) <= tol) {
+                            count++; sx += xx; sy += yy
+                            if (xx < minX) minX = xx; if (xx > maxX) maxX = xx
+                            if (yy < minY) minY = yy; if (yy > maxY) maxY = yy
+                        }
+                        xx += stride
+                    }
+                    yy += stride
+                }
+                JSONObject().apply {
+                    put("matches", count)
+                    if (count > 0) {
+                        put("centroid", JSONArray(listOf(sx / count, sy / count)))
+                        put("bbox", JSONArray(listOf(minX, minY, maxX, maxY)))
+                        put("centroid_normalized", JSONArray(listOf(
+                            (sx / count).toDouble() / bmp.width, (sy / count).toDouble() / bmp.height)))
+                    }
+                }
+            }
+            return ok((found ?: JSONObject().put("matches", 0)).put("ok", true))
+        }
+
+        if (path == "/reflex/rules" && method == Method.GET) {
+            return ok(ReflexEngine.listJson())
+        }
+        if (path == "/reflex/rules" && method == Method.POST) {
+            return ok(ReflexEngine.addRule(readJson(session)))
+        }
+        if (path == "/reflex/delete" && method == Method.POST) {
+            val b = readJson(session)
+            return ok(JSONObject().put("ok", ReflexEngine.removeRule(b.optString("id"))))
+        }
+        if (path == "/reflex/clear" && method == Method.POST) {
+            ReflexEngine.clear()
+            return ok(JSONObject().put("ok", true))
+        }
+        if (path == "/reflex/enable" && method == Method.POST) {
+            val b = readJson(session)
+            ReflexEngine.setEnabled(b.optBoolean("enabled", true))
+            return ok(JSONObject().put("ok", true).put("enabled", ReflexEngine.enabled))
+        }
+
         return err(Response.Status.NOT_FOUND, "Unknown endpoint: $method $path")
+    }
+
+    private fun parseColorArg(v: Any?): Int? = when (v) {
+        is String -> runCatching { Color.parseColor(if (v.startsWith("#")) v else "#$v") }.getOrNull()
+        is JSONArray -> if (v.length() >= 3) Color.rgb(v.optInt(0), v.optInt(1), v.optInt(2)) else null
+        is Int -> v
+        else -> null
     }
 }

@@ -18,6 +18,21 @@ Built as the mobile counterpart to [`cid0980/agent_bridge`](https://github.com/c
 
 ---
 
+## ⚡ Realtime layer (v1.4) — human-like, low-latency control
+
+Built for seamless agent control and game-style tasks, so the only real delay is the network:
+
+- **Continuous multi-touch** — held, smoothly-dragging fingers (`/gui/touch`, WS `touch_*`, binary), not discrete taps. Up to 5 pointers.
+- **Fast frame source** — MediaProjection capture after a one-time consent breaks the ~3 fps accessibility-screenshot limit (`/capture/*`). Enable it in-app: **Realtime fast capture**.
+- **On-device reflexes** — stimulus→response rules run at frame rate in-process (`/reflex/*`), so the phone can react/fight without an AI round-trip per frame.
+- **Binary WebSocket + live stream** — frames and touch skip JSON/base64; `stream_start` pushes binary JPEG frames.
+- **Benchmark harness** — `python agent/connectwin_client.py bench --n 40` measures every path.
+
+See **[REALTIME.md](REALTIME.md)** for the full API, reflex examples, and tuning tips. A desktop
+`Connect-win-agent.exe` is built by GitHub Actions and attached to the latest release.
+
+---
+
 ## 🚀 Setup on Your Phone (2 Minutes)
 
 1. Download **`Connect-win-arm64.apk`** from [**Releases**](../../releases/latest) (or the latest GitHub Actions run artifact) and install it.

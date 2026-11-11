@@ -1,0 +1,53 @@
+name: Build desktop agent (exe)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+      - '.github/workflows/build-agent-exe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: Connect-win-agent-windows.exe
+            bin: Connect-win-agent.exe
+          - os: ubuntu-latest
+            asset: Connect-win-agent-linux
+            bin: Connect-win-agent
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install pyinstaller requests websocket-client
+      - name: Build single-file executable
+        run: pyinstaller --onefile --name Connect-win-agent agent/connectwin_client.py
+      - name: Rename asset
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "dist/${{ matrix.bin }}" "out/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+      - name: Attach to rolling release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || gh release create latest --title 'Latest build' --notes 'Latest successful build of Connect-win.'
+          gh release upload latest "out/${{ matrix.asset }}" --clobber

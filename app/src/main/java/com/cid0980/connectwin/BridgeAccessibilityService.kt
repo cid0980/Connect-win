@@ -38,6 +38,16 @@ class BridgeAccessibilityService : AccessibilityService() {
 
     private val shotExecutor = Executors.newSingleThreadExecutor()
     private val arenaMonitor by lazy { ArenaCompletionMonitor(this) }
+    private val touch by lazy { com.cid0980.connectwin.realtime.ContinuousTouchEngine(this) }
+
+    // Continuous, human-like multi-touch (held fingers, coalesced moves).
+    fun touchDown(pointer: Int, x: Int, y: Int) = touch.down(pointer, x, y)
+    fun touchMove(pointer: Int, x: Int, y: Int) = touch.move(pointer, x, y)
+    fun touchUp(pointer: Int) = touch.up(pointer)
+    fun touchPress(pointer: Int, x: Int, y: Int, holdMs: Long) = touch.press(pointer, x, y, holdMs)
+    fun touchCancelAll() = touch.cancelAll()
+    fun touchState(): JSONObject = touch.stateJson()
+    fun setTouchTickMs(ms: Long) = touch.setTickMs(ms)
 
     data class ParsedNode(
         val ref: Int,
@@ -106,6 +116,7 @@ class BridgeAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         arenaMonitor.stop()
+        runCatching { touch.shutdown() }
         if (instance === this) instance = null
         BridgeState.log("AccessibilityService disconnected")
         super.onDestroy()
