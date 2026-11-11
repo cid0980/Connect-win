@@ -23,7 +23,7 @@ data class BridgeSnapshot(
 )
 
 object BridgeState {
-    const val VERSION = "1.2.0"
+    const val VERSION = "1.2.1"
     const val HTTP_PORT = 8765
     private const val PREFS_NAME = "connect_win_prefs"
     private const val KEY_TOKEN = "bridge_token"

@@ -12,6 +12,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Point
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -46,6 +47,7 @@ import android.speech.tts.TextToSpeech
 import android.telephony.SmsManager
 import android.util.Base64
 import android.view.KeyEvent
+import android.view.WindowManager
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -154,7 +156,9 @@ object PhoneController {
         val totalGb = (stat.totalBytes.toDouble() / (1024.0 * 1024.0 * 1024.0))
 
         val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val dm = ctx.resources.displayMetrics
+        val displaySize = Point()
+        @Suppress("DEPRECATION")
+        (ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealSize(displaySize)
 
         return JSONObject().apply {
             put("manufacturer", Build.MANUFACTURER)
@@ -166,7 +170,7 @@ object PhoneController {
             put("network", netType)
             put("screen_on", pm.isInteractive)
             put("device_locked", km.isKeyguardLocked)
-            put("screen", JSONArray(listOf(dm.widthPixels, dm.heightPixels)))
+            put("screen", JSONArray(listOf(displaySize.x, displaySize.y)))
             put("foreground_package", BridgeAccessibilityService.currentPackage)
             put("foreground_activity", BridgeAccessibilityService.currentActivity)
             put("ram_avail_gb", "%.1f".format(Locale.US, memInfo.availMem / 1e9))
