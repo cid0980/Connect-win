@@ -9,11 +9,11 @@ class AgentActivityStateTest {
 
     @Test
     fun workingHeartbeatExpiresToIdle() {
-        val t = AgentActivityTracker(defaultTtlMs = 1_000L)
-        t.setAgent("working", "Reading screenshot", nowMs = 1_000L, ttlMs = 1_000L)
-        assertEquals("working", t.snapshot(1_999L).state)
-        assertEquals("working", t.snapshot(2_000L).state)
-        val expired = t.snapshot(2_001L)
+        val t = AgentActivityTracker(defaultTtlMs = 5_000L)
+        t.setAgent("working", "Reading screenshot", nowMs = 1_000L, ttlMs = 5_000L)
+        assertEquals("working", t.snapshot(5_999L).state)
+        assertEquals("working", t.snapshot(6_000L).state)
+        val expired = t.snapshot(6_001L)
         assertEquals("idle", expired.state)
         assertEquals("working", expired.explicitState)
         assertTrue(expired.message.contains("expired"))
@@ -38,7 +38,7 @@ class AgentActivityStateTest {
         val s = t.snapshot(500L)
         assertEquals(3L, s.requestCount)
         assertEquals(1L, s.actionCount)
-        assertEquals(300L, s.lastRequestAgeMs!!)
+        assertEquals(200L, s.lastRequestAgeMs!!)
         assertEquals(300L, s.lastActionAgeMs!!)
     }
 

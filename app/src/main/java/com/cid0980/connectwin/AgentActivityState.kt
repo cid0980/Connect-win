@@ -24,10 +24,10 @@ class AgentActivityTracker(private val defaultTtlMs: Long = 90_000L) {
 
     private var explicitState: String = "idle"
     private var message: String = ""
-    private var heartbeatAtMs: Long = 0L
+    private var heartbeatAtMs: Long = -1L
     private var ttlMs: Long = defaultTtlMs
-    private var lastRequestAtMs: Long = 0L
-    private var lastActionAtMs: Long = 0L
+    private var lastRequestAtMs: Long = -1L
+    private var lastActionAtMs: Long = -1L
     private var requestCount: Long = 0L
     private var actionCount: Long = 0L
 
@@ -56,7 +56,7 @@ class AgentActivityTracker(private val defaultTtlMs: Long = 90_000L) {
 
     @Synchronized
     fun snapshot(nowMs: Long): Snapshot {
-        val heartbeatAge = if (heartbeatAtMs == 0L) null else (nowMs - heartbeatAtMs).coerceAtLeast(0L)
+        val heartbeatAge = if (heartbeatAtMs < 0L) null else (nowMs - heartbeatAtMs).coerceAtLeast(0L)
         val expired = explicitState == "working" && heartbeatAge != null && heartbeatAge > ttlMs
         val effective = if (expired) "idle" else explicitState
         val effectiveMessage = when {
@@ -84,7 +84,7 @@ class AgentActivityTracker(private val defaultTtlMs: Long = 90_000L) {
     }
 
     private fun age(atMs: Long, nowMs: Long): Long? =
-        if (atMs == 0L) null else (nowMs - atMs).coerceAtLeast(0L)
+        if (atMs < 0L) null else (nowMs - atMs).coerceAtLeast(0L)
 
     private fun sanitize(raw: String): String =
         raw.filter { it >= ' ' || it == '\t' || it == '\n' || it == '\r' }.trim().take(180)
