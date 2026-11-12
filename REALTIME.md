@@ -37,6 +37,18 @@ meaningful delay the **network** — not a screenshot→think→tap loop.
 2. Approve the Android screen-share prompt. A notification stays while it's active.
 3. `GET /capture/status` should now report `running: true, source: mediaprojection`.
 
+Since v1.5.0, full-frame JPEG `/screenshot`, `/gui/screenshot`, and `/shot` also use this
+fast frame store (with accessibility fallback). Cropped or PNG requests still use the
+accessibility screenshot path.
+
+## Agent activity indicator (v1.5.0)
+The bridge notification is an honest progress indicator, not a guess:
+- `POST /agent/status {"state":"working|paused|idle|done","message":"...","ttl_ms":90000}`
+- `GET /agent/status` → `{activity:{state,message,last_action_age_ms,last_request_age_ms,...}}`
+- `working` expires after `ttl_ms` (default 90 s, clamped 5–300 s). The notification refreshes
+  every 5 s and shows the last move/request age, so a dead agent cannot stay "working".
+- The agent client can hold a heartbeat: `connectwin_client.py heartbeat --message "..." --interval 15`.
+
 Without this, frames fall back to the rate-limited accessibility screenshot.
 
 ## Continuous touch

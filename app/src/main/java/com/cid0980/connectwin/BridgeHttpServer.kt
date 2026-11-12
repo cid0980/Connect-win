@@ -3,6 +3,7 @@ package com.cid0980.connectwin
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.os.SystemClock
 import android.util.Base64
 import com.cid0980.connectwin.realtime.BinaryProtocol
 import com.cid0980.connectwin.realtime.ReflexEngine
@@ -123,6 +124,18 @@ class BridgeHttpServer(
         put("source", if (ScreenCaptureService.isRunning()) "mediaprojection" else "accessibility")
     }
 
+    private fun activityJson(s: AgentActivityTracker.Snapshot): JSONObject = JSONObject().apply {
+        put("state", s.state)
+        put("message", s.message)
+        put("explicit_state", s.explicitState)
+        put("last_request_age_ms", s.lastRequestAgeMs ?: JSONObject.NULL)
+        put("last_action_age_ms", s.lastActionAgeMs ?: JSONObject.NULL)
+        put("heartbeat_age_ms", s.heartbeatAgeMs ?: JSONObject.NULL)
+        put("expires_in_s", s.expiresInSeconds ?: JSONObject.NULL)
+        put("request_count", s.requestCount)
+        put("action_count", s.actionCount)
+    }
+
     override fun serve(session: IHTTPSession): Response {
         val path = session.uri ?: "/"
         val method = session.method
@@ -162,6 +175,7 @@ class BridgeHttpServer(
         }
 
         BridgeState.incrementRequests()
+        AgentActivity.observeRequest(path, method.name, SystemClock.elapsedRealtime())
         val t0 = System.currentTimeMillis()
 
         return try {
@@ -486,7 +500,24 @@ class BridgeHttpServer(
                 put("permissions", PhoneController.permissionsStatus(context))
                 put("device", PhoneController.deviceStatus(context))
                 put("notifications_active", BridgeNotificationService.instance?.listNotificationsJson(false)?.optInt("active_count", 0) ?: 0)
+                put("agent_activity", activityJson(AgentActivity.snapshot(SystemClock.elapsedRealtime())))
+                put("capture", captureStatusJson())
             })
+        }
+
+        if (path == "/agent/status" && method == Method.GET) {
+            return ok(JSONObject().put("ok", true)
+                .put("activity", activityJson(AgentActivity.snapshot(SystemClock.elapsedRealtime()))))
+        }
+
+        if (path == "/agent/status" && method == Method.POST) {
+            val b = readJson(session)
+            val state = b.optString("state", "working")
+            val message = b.optString("message", "")
+            val ttl = if (b.has("ttl_ms")) b.optLong("ttl_ms") else null
+            val snap = AgentActivity.setAgent(state, message, SystemClock.elapsedRealtime(), ttl)
+            BridgeState.log("AGENT ${snap.state}: ${snap.message}")
+            return ok(JSONObject().put("ok", true).put("activity", activityJson(snap)))
         }
 
         if (path == "/system-info" && method == Method.GET) {
@@ -502,12 +533,28 @@ class BridgeHttpServer(
         // 2. SCREENSHOTS (/shot base64 JSON + /screenshot raw bytes)
         // ==============================================================
         if ((path == "/screenshot" || path == "/gui/screenshot") && method == Method.GET) {
-            val a11y = requireA11y()
-            val shot = a11y.captureScreenshot(
-                region = q(session, "region"),
-                maxWidth = q(session, "max_width")?.toIntOrNull(),
-                format = q(session, "format") ?: "jpg",
-                quality = q(session, "quality")?.toIntOrNull() ?: 75
+            val region = q(session, "region")
+            val fmt = (q(session, "format") ?: "jpg").lowercase()
+            val maxW = q(session, "max_width")?.toIntOrNull() ?: 0
+            val qual = q(session, "quality")?.toIntOrNull() ?: 75
+            // Full-frame JPEG uses the shared fast path (MediaProjection when enabled,
+            // accessibility fallback otherwise). Cropped/PNG shots still use a11y.
+            if (region.isNullOrBlank() && (fmt == "jpg" || fmt == "jpeg")) {
+                val f = grabFrame(maxW, qual)
+                val resp = newFixedLengthResponse(
+                    Response.Status.OK, "image/jpeg",
+                    ByteArrayInputStream(f.bytes), f.bytes.size.toLong()
+                )
+                resp.addHeader("X-Capture-Source", f.source)
+                resp.addHeader("X-Frame-Seq", f.seq.toString())
+                resp.addHeader("X-Frame-Age-Ms", ScreenCaptureService.frameStore.ageMs().toString())
+                return resp
+            }
+            val shot = requireA11y().captureScreenshot(
+                region = region,
+                maxWidth = if (maxW > 0) maxW else null,
+                format = fmt,
+                quality = qual
             )
             return newFixedLengthResponse(
                 Response.Status.OK,
@@ -521,8 +568,25 @@ class BridgeHttpServer(
             val body = if (method == Method.POST) readJson(session) else JSONObject()
             val region = body.optString("region", "").ifEmpty { q(session, "region") }
             val maxW = if (body.has("max_width")) body.optInt("max_width") else (q(session, "max_width")?.toIntOrNull() ?: 720)
-            val fmt = body.optString("format", q(session, "format") ?: "jpg")
+            val fmt = body.optString("format", q(session, "format") ?: "jpg").lowercase()
             val qual = body.optInt("quality", q(session, "quality")?.toIntOrNull() ?: 72)
+
+            if (region.isNullOrBlank() && (fmt == "jpg" || fmt == "jpeg")) {
+                val f = grabFrame(maxW, qual)
+                val b64 = Base64.encodeToString(f.bytes, Base64.NO_WRAP)
+                return ok(JSONObject().apply {
+                    put("ok", true)
+                    put("mime", "image/jpeg")
+                    put("bytes", f.bytes.size)
+                    put("orig_w", f.origW)
+                    put("orig_h", f.origH)
+                    put("w", f.w)
+                    put("h", f.h)
+                    put("source", f.source)
+                    put("seq", f.seq)
+                    put("b64", b64)
+                })
+            }
 
             val shot = requireA11y().captureScreenshot(
                 region = region,
@@ -539,6 +603,7 @@ class BridgeHttpServer(
                 put("orig_h", shot.origHeight)
                 put("w", shot.outWidth)
                 put("h", shot.outHeight)
+                put("source", "accessibility")
                 put("b64", b64)
                 if (shot.mime == "image/png") put("png_b64", b64)
             })

@@ -172,6 +172,30 @@ def cmd_status(c, args):
     print(json.dumps(c.http("GET", "/status"), indent=2))
 
 
+def cmd_activity(c, args):
+    if args.get:
+        print(json.dumps(c.http("GET", "/agent/status"), indent=2))
+        return
+    body = {"state": args.state, "message": args.message or ""}
+    if args.ttl_ms is not None:
+        body["ttl_ms"] = args.ttl_ms
+    print(json.dumps(c.http("POST", "/agent/status", body=body), indent=2))
+
+
+def cmd_heartbeat(c, args):
+    """Keep the phone notification honestly 'working' while a long agent task runs."""
+    interval = max(5, args.interval)
+    ttl = args.ttl_ms or (interval * 4 * 1000)
+    try:
+        while True:
+            c.http("POST", "/agent/status", body={
+                "state": "working", "message": args.message, "ttl_ms": ttl,
+            })
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        c.http("POST", "/agent/status", body={"state": "idle", "message": "Heartbeat stopped"})
+
+
 def cmd_shot(c, args):
     data = c.http("GET", "/capture/frame", params={"max_width": args.max_width, "quality": args.quality}, raw=True)
     out = args.out or "frame.jpg"
@@ -373,6 +397,17 @@ def build_parser():
 
     sub.add_parser("status")
 
+    sp = sub.add_parser("activity", help="read or set the phone's agent-activity notification")
+    sp.add_argument("state", nargs="?", choices=["working", "paused", "idle", "done"], default="working")
+    sp.add_argument("--message", default="")
+    sp.add_argument("--ttl-ms", type=int, default=None)
+    sp.add_argument("--get", action="store_true")
+
+    sp = sub.add_parser("heartbeat", help="repeat a working heartbeat until Ctrl-C")
+    sp.add_argument("--message", default="Agent is working")
+    sp.add_argument("--interval", type=int, default=15)
+    sp.add_argument("--ttl-ms", type=int, default=None)
+
     sp = sub.add_parser("shot")
     sp.add_argument("--out"); sp.add_argument("--max-width", type=int, default=720); sp.add_argument("--quality", type=int, default=70)
 
@@ -409,7 +444,8 @@ def main():
     args = build_parser().parse_args()
     c = BridgeClient(args.url, args.token)
     fn = {
-        "status": cmd_status, "shot": cmd_shot, "pixel": cmd_pixel, "find-color": cmd_find_color,
+        "status": cmd_status, "activity": cmd_activity, "heartbeat": cmd_heartbeat,
+        "shot": cmd_shot, "pixel": cmd_pixel, "find-color": cmd_find_color,
         "touch": cmd_touch, "ws-touch": cmd_ws_touch, "reflex": cmd_reflex,
         "stream": cmd_stream, "bench": cmd_bench,
     }[args.cmd]

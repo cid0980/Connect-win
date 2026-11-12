@@ -31,6 +31,21 @@ Built for seamless agent control and game-style tasks, so the only real delay is
 See **[REALTIME.md](REALTIME.md)** for the full API, reflex examples, and tuning tips. A desktop
 `Connect-win-agent.exe` is built by GitHub Actions and attached to the latest release.
 
+### Agent activity notification (v1.5.0)
+
+The persistent bridge notification now shows whether the agent is **working / paused / finished / idle**,
+the current step, and how long ago the last move or request happened. It refreshes every 5 seconds and
+keeps the tunnel URL + STOP button visible, so you can check progress from the notification shade without
+opening the chat and stealing foreground from the game.
+
+- `POST /agent/status` with `{"state":"working","message":"Reading screenshot","ttl_ms":90000}` sets the indicator.
+  A `working` heartbeat expires (default 90 s) so a stopped agent cannot look active forever.
+- `GET /agent/status` and `/status` return the same activity snapshot.
+- Agent client: `python agent/connectwin_client.py activity working --message "Upgrading furniture"` or
+  `python agent/connectwin_client.py heartbeat --message "Playing Rent Please" --interval 15`.
+- Full-frame JPEG `/screenshot` and `/shot` now use the fast MediaProjection frame store when enabled
+  (accessibility fallback otherwise). Cropped/PNG shots still use accessibility.
+
 ---
 
 ## 🚀 Setup on Your Phone (2 Minutes)

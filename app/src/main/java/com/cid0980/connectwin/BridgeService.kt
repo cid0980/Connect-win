@@ -11,8 +11,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -52,6 +55,15 @@ class BridgeService : Service() {
     private var httpServer: BridgeHttpServer? = null
     private var tunnelManager: TunnelManager? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private val notificationHandler = Handler(Looper.getMainLooper())
+    private val notificationTicker = object : Runnable {
+        override fun run() {
+            if (BridgeState.snapshot.value.running) {
+                refreshNotification()
+                notificationHandler.postDelayed(this, 5_000L)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -108,9 +120,8 @@ class BridgeService : Service() {
         }
 
         if (tunnelManager == null) {
-            tunnelManager = TunnelManager(applicationContext, serviceScope) { newUrl ->
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIF_ID, buildNotification(newUrl))
+            tunnelManager = TunnelManager(applicationContext, serviceScope) { _ ->
+                refreshNotification()
             }.also { it.start() }
         }
 
@@ -122,10 +133,18 @@ class BridgeService : Service() {
                 startedAtMs = if (it.startedAtMs > 0L) it.startedAtMs else System.currentTimeMillis()
             )
         }
+        notificationHandler.removeCallbacks(notificationTicker)
+        notificationHandler.post(notificationTicker)
+    }
+
+    private fun refreshNotification() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIF_ID, buildNotification(BridgeState.snapshot.value.tunnelUrl))
     }
 
     private fun shutdownBridge() {
         BridgeState.log("Bridge stopping")
+        notificationHandler.removeCallbacks(notificationTicker)
         runCatching { tunnelManager?.stop() }
         tunnelManager = null
         runCatching { httpServer?.stop() }
@@ -180,16 +199,51 @@ class BridgeService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val subtitle = url ?: "Starting Cloudflare tunnel..."
+        val activity = AgentActivity.snapshot(SystemClock.elapsedRealtime())
+        val tunnelLine = url ?: "Starting Cloudflare tunnel..."
+        val lastMove = activity.lastActionAgeMs?.let { "last move ${formatAge(it)}" }
+            ?: activity.lastRequestAgeMs?.let { "last request ${formatAge(it)}" }
+            ?: "no moves yet"
+        val title = when (activity.state) {
+            "working" -> "🤖 Agent working"
+            "paused" -> "⏸ Agent paused"
+            "done" -> "✅ Agent finished"
+            else -> "Connect-win bridge active"
+        }
+        val content = when (activity.state) {
+            "working", "paused", "done" -> "${activity.message} · $lastMove"
+            else -> tunnelLine
+        }
+        val expiresIn = activity.expiresInSeconds
+        val big = buildString {
+            append(content)
+            append("\nBridge: ").append(tunnelLine)
+            append("\nStatus: ").append(activity.state)
+            if (activity.state == "working" && expiresIn != null) {
+                append(" (heartbeat expires in ").append(expiresIn).append("s)")
+            }
+            append("\nMoves: ").append(activity.actionCount)
+            append(" · Requests: ").append(activity.requestCount)
+            append("\nTap STOP to end the bridge and agent control.")
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)
-            .setContentTitle("Connect-win Bridge Active")
-            .setContentText(subtitle)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(subtitle))
+            .setContentTitle(title)
+            .setContentText(content)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(big))
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
             .setContentIntent(openAppPi)
             .addAction(0, "Copy URL+Token", copyPi)
             .addAction(0, "STOP", stopPi)
             .build()
+    }
+
+    private fun formatAge(ms: Long): String = when {
+        ms < 1_000L -> "just now"
+        ms < 60_000L -> "${ms / 1_000L}s ago"
+        ms < 3_600_000L -> "${ms / 60_000L}m ago"
+        else -> "${ms / 3_600_000L}h ago"
     }
 }
