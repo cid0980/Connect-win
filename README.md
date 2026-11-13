@@ -31,6 +31,29 @@ Built for seamless agent control and game-style tasks, so the only real delay is
 See **[REALTIME.md](REALTIME.md)** for the full API, reflex examples, and tuning tips. A desktop
 `Connect-win-agent.exe` is built by GitHub Actions and attached to the latest release.
 
+### v1.6.1 — capture diagnostics, and the fps observation to trust
+
+First on-device run of 1.6.0 produced an important correction: **`/bench/latency` measured
+fps from `frameStore.seq`, which counts *published* frames.** On a static screen
+MediaProjection genuinely delivers nothing, so 0.5–2 fps there means "nothing to show",
+not a broken pipeline. A frozen screen is not a stalled bridge.
+
+But the same run also exposed a case where publishing really did stop: `seq` froze at 321
+while `frame_age_ms` climbed to 7.4 s and `running` stayed `true`. From outside, that is
+indistinguishable from a slow scene. So this release makes the stages visible:
+
+- **`/capture/status` now includes `diag`** with monotonic counters —
+  `image_available`, `acquired`, `throttle_skipped`, `convert_failed`, `published`,
+  `exceptions` — and a plain-language `verdict` (`no_frames_from_display`,
+  `acquire_failing`, `conversion_failing`, `throttled`, `publishing`, `idle`).
+  The existing message was that MessageQueue sometimes delivers only one image per
+  listener registration while reporting success.
+- **`POST /capture/restart`** recreates the VirtualDisplay and ImageReader while keeping
+  the MediaProjection grant. Recovers a stalled pipeline without the one thing an agent
+  can never do remotely: approve the consent dialog.
+- Frame conversion failures are now logged with the exception message rather than only
+  the class name.
+
 ### v1.6.0 — measurement, honest input, resilient fingers
 
 This release is deliberately about **knowing what the bridge actually costs**, because

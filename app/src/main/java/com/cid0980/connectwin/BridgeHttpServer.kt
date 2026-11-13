@@ -127,6 +127,11 @@ class BridgeHttpServer(
         // Without this, an agent silently falls back to the slow screenshot path and
         // concludes the phone is broken rather than unconsented.
         put("wanted", BridgeState.captureWanted)
+        // Per-stage counters. When seq stops climbing these say whether frames stopped
+        // arriving, whether they are being throttled, or whether conversion is failing.
+        if (ScreenCaptureService.isRunning()) {
+            put("diag", ScreenCaptureService.diagnostics())
+        }
         if (BridgeState.captureWanted && !ScreenCaptureService.isRunning()) {
             put(
                 "warning",
@@ -1152,6 +1157,19 @@ class BridgeHttpServer(
             return ok(JSONObject().put("ok", ScreenCaptureService.isRunning())
                 .put("running", ScreenCaptureService.isRunning())
                 .put("note", "MediaProjection needs one-time on-device consent. Tap 'Enable fast capture' in the Connect-win app."))
+        }
+
+        // Restart the virtual display without losing the MediaProjection grant. Useful
+        // when the pipeline stalls (seq frozen) but consent is still held.
+        if (path == "/capture/restart" && method == Method.POST) {
+            val srvc = ScreenCaptureService.instance
+            if (srvc == null) {
+                return ok(JSONObject().put("ok", false)
+                    .put("error", "capture_not_running")
+                    .put("hint", "Consent cannot be re-granted remotely; tap 'Enable fast capture' in the app."))
+            }
+            val r = srvc.restartDisplay()
+            return ok(r.put("was_wanted", BridgeState.captureWanted))
         }
 
         if (path == "/capture/stop" && method == Method.POST) {

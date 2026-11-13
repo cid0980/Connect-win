@@ -51,6 +51,46 @@ class ScreenCaptureService : Service() {
         @Volatile var instance: ScreenCaptureService? = null; private set
         val frameStore = FrameStore()
 
+        // --- capture diagnostics -------------------------------------------------
+        // These exist because "seq is not climbing" has several very different causes
+        // (no frames arriving, frames arriving but throttled, frames arriving but the
+        // bitmap conversion failing) and without counters they are indistinguishable
+        // from the outside. Observed on-device: seq froze at 321 with frame_age_ms
+        // climbing, while capture reported running = true.
+        private val imageAvailableCount = java.util.concurrent.atomic.AtomicLong(0)
+        private val acquiredCount = java.util.concurrent.atomic.AtomicLong(0)
+        private val throttleSkipCount = java.util.concurrent.atomic.AtomicLong(0)
+        private val convertFailCount = java.util.concurrent.atomic.AtomicLong(0)
+        private val publishCount = java.util.concurrent.atomic.AtomicLong(0)
+        private val exceptionCount = java.util.concurrent.atomic.AtomicLong(0)
+
+        /** Snapshot for /capture/status. Resets nothing; counters are monotonic. */
+        fun diagnostics(): org.json.JSONObject = org.json.JSONObject().apply {
+            put("image_available", imageAvailableCount.get())
+            put("acquired", acquiredCount.get())
+            put("throttle_skipped", throttleSkipCount.get())
+            put("convert_failed", convertFailCount.get())
+            put("published", publishCount.get())
+            put("exceptions", exceptionCount.get())
+            // Verdict: the single most likely explanation, in plain words.
+            put(
+                "verdict",
+                when {
+                    imageAvailableCount.get() == 0L ->
+                        "no_frames_from_display — the virtual display is not producing " +
+                            "frames at all (re-grant MediaProjection consent)"
+                    acquiredCount.get() == 0L ->
+                        "acquire_failing — listener fires but buffers are not being acquired"
+                    convertFailCount.get() > 0L && convertFailCount.get() == acquiredCount.get() ->
+                        "conversion_failing — every acquired frame fails to convert"
+                    throttleSkipCount.get() in 1 until (acquiredCount.get() / 2) ->
+                        "throttled — frames arrive but most are dropped by the fps cap"
+                    publishCount.get() > 0L -> "publishing"
+                    else -> "idle"
+                }
+            )
+        }
+
         fun isRunning(): Boolean = instance != null
 
         fun start(ctx: Context, resultCode: Int, data: Intent, maxWidth: Int, fps: Int) {
@@ -167,11 +207,14 @@ class ScreenCaptureService : Service() {
             // publishing (~1.3 fps measured on-device instead of the configured 30).
             // Now we always acquire and always close; throttling is a no-op decision
             // that still releases the buffer.
+            imageAvailableCount.incrementAndGet()
             val img = try {
                 ir.acquireLatestImage()
             } catch (t: Throwable) {
+                exceptionCount.incrementAndGet()
                 null
             } ?: return@setOnImageAvailableListener
+            acquiredCount.incrementAndGet()
             // `run` gives the block a name we can return from, which is what the
             // original bug needed: `try` in Kotlin is not a lambda, so you cannot
             // `return@try` to skip work while still running `finally`. Escaping the
@@ -180,10 +223,17 @@ class ScreenCaptureService : Service() {
                 run throttled@{
                     val now = SystemClock.elapsedRealtime()
                     val minInterval = if (fps > 0) 1000L / fps else 0L
-                    if (now - lastFrameAt < minInterval) return@throttled
+                    if (now - lastFrameAt < minInterval) {
+                        throttleSkipCount.incrementAndGet()
+                        return@throttled
+                    }
                     lastFrameAt = now
-                    val bmp = imageToBitmap(img) ?: return@throttled
+                    val bmp = imageToBitmap(img) ?: run {
+                        convertFailCount.incrementAndGet()
+                        return@throttled
+                    }
                     frameStore.publish(bmp)
+                    publishCount.incrementAndGet()
                     val publishedAt = SystemClock.elapsedRealtime()
                     // Instrumentation: capture->publish cost, and resolution of any
                     // pending dispatch->seen measurements against this new frame.
@@ -198,7 +248,8 @@ class ScreenCaptureService : Service() {
                     ReflexEngine.onFrame()
                 }
             } catch (t: Throwable) {
-                BridgeState.log("Capture frame error: ${t.javaClass.simpleName}")
+                exceptionCount.incrementAndGet()
+                BridgeState.log("Capture frame error: ${t.javaClass.simpleName}: ${t.message}")
             } finally {
                 img.close()
             }
@@ -231,6 +282,24 @@ class ScreenCaptureService : Service() {
             } else bmp
         } catch (t: Throwable) {
             null
+        }
+    }
+
+    /**
+     * Tear down and recreate the VirtualDisplay + ImageReader while keeping the
+     * existing MediaProjection grant. Recovers a stalled pipeline (frames stop
+     * arriving, or every buffer fails to convert) without an on-device consent prompt,
+     * which is the only part of capture an agent cannot do remotely.
+     */
+    fun restartDisplay(): org.json.JSONObject {
+        val out = org.json.JSONObject()
+        return try {
+            createVirtualDisplay()
+            BridgeState.log("Capture: display restarted")
+            out.put("ok", true).put("restarted", true)
+        } catch (t: Throwable) {
+            BridgeState.log("Capture: restart failed ${t.javaClass.simpleName}")
+            out.put("ok", false).put("error", t.javaClass.simpleName + ": " + t.message)
         }
     }
 
