@@ -154,3 +154,31 @@ the X (304 ms) — so this is specific to that one control, not broken input.
 returned `ok: true` and I would have had no way to distinguish "button is broken" from
 "my coordinates are wrong". This is the strongest evidence so far that verification is the
 right default for agent input.
+
+## 8. "Accepted but ignored" needs its own diagnostic
+
+The 11 ignored taps (section 7) were legible only as `effect: unchanged`. That is the
+symptom, not the cause, and it covers at least four very different faults:
+
+| Cause | What you need to see |
+|---|---|
+| coordinates off-screen | bounds check against the real screen size |
+| tap landed on dead space / overlay | whether any view claimed the point |
+| view present but inert (disabled, not clickable) | the view's own flags |
+| custom-drawn surface (Unity / Flutter / Canvas) | *no* view at all — hit testing is invisible to us |
+
+The fourth case is the important one for Genshin. Unity surfaces report a single
+fullscreen node and nothing else, so "is this point live?" cannot be answered by
+inspection at all — only by tapping and verifying. That is a fundamental limit of
+accessibility-based control on custom-rendered games, not a gap in the bridge.
+
+`POST /gui/probe {x,y}` now reports: `in_bounds`, `nodes` claiming the point, the deepest
+node's class/text/clickable/enabled/bounds, `frame_age_ms`, `capture_healthy`, and a
+`verdict` of `out_of_bounds | node_clickable | node_not_clickable | node_disabled |
+node_invisible | no_node`, plus a hint for each. It touches nothing, so it is safe to run
+before a tap.
+
+Also worth stating for the protocol: **Android dispatches off-screen gestures
+successfully.** A tap at (540, 3000) on a 1080x2400 screen returns `ok: true` and does
+nothing. Combined with the render/physical 2x scale trap, this is the most likely way for
+an agent to be confidently wrong, which is why bounds are now reported explicitly.

@@ -770,6 +770,108 @@ class BridgeHttpServer(
             return ok(JSONObject().put("ok", okTap).put("clicked", JSONArray(listOf(x, y))))
         }
 
+        // Diagnose WHY a point did or did not respond, without touching it.
+        // Born from a control that ignored 11 taps while neighbours in the same panel
+        // worked: verify=1 can say "nothing changed" but not whether the point was a
+        // real view, dead space, or an inert image inside a Unity/Flutter surface.
+        // Knowing that is the difference between fixing the cause and guessing at coords.
+        if (path == "/gui/probe" && method == Method.POST) {
+            val b = readJson(session)
+            val x = b.getInt("x")
+            val y = b.getInt("y")
+            val a11y = requireA11y()
+            val res = JSONObject()
+            res.put("point", JSONArray(listOf(x, y)))
+            val (sw, sh) = a11y.screenSize()
+            res.put("screen", JSONArray(listOf(sw, sh)))
+
+            // Is it inside the screen at all? Off-screen taps are dispatched happily
+            // by Android and silently do nothing.
+            val inBounds = x in 0 until sw && y in 0 until sh
+            res.put("in_bounds", inBounds)
+            if (!inBounds) {
+                res.put("verdict", "out_of_bounds")
+                res.put(
+                    "hint",
+                    "Android dispatches off-screen gestures successfully, so this looks " +
+                        "identical to a working tap unless you check. Remember screenshots " +
+                        "are commonly half physical resolution."
+                )
+            }
+
+            // Is there an accessibility node at this point? A hit means a real view was
+            // there and can be reported as not-clickable/enabled, which is decisive.
+            var verdict = if (inBounds) "unknown" else "out_of_bounds"
+            var nodeInfo: JSONObject? = null
+            try {
+                val root = a11y.rootInActiveWindow
+                if (root == null) {
+                    res.put("nodes", 0)
+                } else {
+                    val hits = ArrayList<android.view.accessibility.AccessibilityNodeInfo>()
+                    fun walk(n: android.view.accessibility.AccessibilityNodeInfo, depth: Int) {
+                        if (depth > 40) return
+                        val r = android.graphics.Rect()
+                        n.getBoundsInScreen(r)
+                        if (r.contains(x, y)) hits.add(n)
+                        for (i in 0 until n.childCount) {
+                            val c = n.getChild(i) ?: continue
+                            walk(c, depth + 1)
+                        }
+                    }
+                    walk(root, 0)
+                    res.put("nodes", hits.size)
+                    if (hits.isNotEmpty()) {
+                        val n = hits.last() // deepest wins
+                        nodeInfo = JSONObject().apply {
+                            put("class", n.className?.toString() ?: "")
+                            put("text", n.text?.toString() ?: "")
+                            put("desc", n.contentDescription?.toString() ?: "")
+                            put("clickable", n.isClickable)
+                            put("enabled", n.isEnabled)
+                            put("visible", n.isVisibleToUser)
+                            val r = android.graphics.Rect(); n.getBoundsInScreen(r)
+                            put("bounds", JSONArray(listOf(r.left, r.top, r.right, r.bottom)))
+                        }
+                        res.put("node", nodeInfo)
+                        verdict = when {
+                            !n.isVisibleToUser -> "node_invisible"
+                            !n.isEnabled -> "node_disabled"
+                            n.isClickable -> "node_clickable"
+                            else -> "node_not_clickable"
+                        }
+                    } else {
+                        verdict = "no_node"
+                    }
+                }
+            } catch (e: Exception) {
+                res.put("node_error", e.message ?: "unknown")
+            }
+
+            // Frame freshness: "unchanged" means nothing if capture is stalled.
+            val age = ScreenCaptureService.frameStore.ageMs()
+            res.put("frame_age_ms", age)
+            res.put("capture_healthy", age in 0L..1500L)
+
+            res.put("verdict", verdict)
+            res.put("hint", when (verdict) {
+                "node_clickable" ->
+                    "A clickable native view is here; a tap should work. If it did not, " +
+                        "try verify=1 to time the response, and check for an overlay."
+                "node_not_clickable" ->
+                    "A native view is here but is not clickable or does not handle input " +
+                        "itself. Tapping it is likely ignored; its parent may handle the tap."
+                "node_disabled" -> "The view here is disabled; taps will be swallowed."
+                "node_invisible" -> "The view here is not visible to the user."
+                "no_node" ->
+                    "No native view at this point: this is a custom-drawn surface (Unity, " +
+                        "Flutter, Canvas, video). Hit testing is invisible to us, so the only " +
+                        "way to know whether a point is live is to tap it and verify the result."
+                else -> "See nodes / frame_age_ms."
+            })
+            return ok(res)
+        }
+
         if (path == "/gui/longpress" && method == Method.POST) {
             val b = readJson(session)
             val x = b.getInt("x")
