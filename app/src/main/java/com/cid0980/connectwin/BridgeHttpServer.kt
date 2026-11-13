@@ -836,7 +836,16 @@ class BridgeHttpServer(
                     }
                     res.put("container_only", meaningful.isEmpty() && hits.isNotEmpty())
                     if (meaningful.isNotEmpty()) {
-                        val n = meaningful.last() // deepest real target wins
+                        // Deepest real node wins - but a non-clickable label is not the
+                        // answer. Verified on-device: probing the "Wi-Fi" row of Settings
+                        // returned node_not_clickable because the deepest node was a
+                        // TextView child, yet tapping it navigated fine, because the
+                        // clickable LinearLayout parent handled the touch. Reporting the
+                        // label as "not clickable" invites an agent to skip a perfectly
+                        // good control. So prefer the deepest CLICKABLE node among the
+                        // hits, and only fall back to a non-clickable one if none exists.
+                        val clickable = meaningful.filter { it.isClickable && it.isEnabled }
+                        val n = (clickable.lastOrNull() ?: meaningful.last())
                         nodeInfo = JSONObject().apply {
                             put("class", n.className?.toString() ?: "")
                             put("text", n.text?.toString() ?: "")
@@ -852,6 +861,7 @@ class BridgeHttpServer(
                             !n.isVisibleToUser -> "node_invisible"
                             !n.isEnabled -> "node_disabled"
                             n.isClickable -> "node_clickable"
+                            clickable.isNotEmpty() -> "node_clickable"
                             else -> "node_not_clickable"
                         }
                     } else if (hits.isNotEmpty()) {

@@ -259,3 +259,43 @@ Two lessons, both now enforced in code:
 Why it changed behaviour at all: the same APK, same signing key, that installed silently five
 times. Play Protect's verdict is not stable across attempts, so an install path must never
 assume it will not appear.
+
+## 13. v1.6.8 verified on device — and one more probe flaw found
+
+Installed and confirmed live. All new surfaces answered correctly:
+
+```
+/health                      -> 1.6.8
+/status                      -> accessibility true, accessibility_setting true,
+                                accessibility_live true, warning null
+/reflex/release_all          -> {"ok":true,"released":"all_pointers"}
+/capture/fps                 -> {"ok":true,"fps":30}
+/reflex/rules                -> releases, watchdog_releases, armed all present
+/a11y/fix                    -> {"ok":true,"needed":false,"accessibility_live":true}
+```
+
+Probe behaviour, before vs after the 1.6.7 fix:
+
+| Surface | v1.6.6 probe | v1.6.8 probe |
+|---|---|---|
+| game UI (3 points) | `node_not_clickable`, identical everywhere | **`container_only`** for all three |
+| Settings: Display row | would have been `node_not_clickable` | **`node_clickable`** |
+| Settings: Wi-Fi row | `node_not_clickable` | `node_not_clickable` ← still wrong |
+
+So the probe now discriminates custom-drawn UI from native UI, which was the point. But the
+Settings result exposed a second flaw of the same kind:
+
+```
+probe (270,1114) "Wi-Fi"  -> node_not_clickable  deepest node = TextView 'Wi-Fi'
+tap   (270,1114)          -> navigated to com.oplus.wirelesssettings
+```
+
+The label is not clickable; its clickable `LinearLayout` parent is, and it handles the touch.
+Reporting `node_not_clickable` because the *deepest* node is a label tells an agent to skip a
+control that works. Fixed in 1.6.9 by preferring the deepest **clickable, enabled** node among
+the hits and only falling back to a non-clickable one when none exists.
+
+This is the third correction to the same endpoint in four versions, and the pattern is
+consistent: **the probe kept choosing a technically-correct node that was the wrong thing to
+answer with.** Accessibility trees describe structure; the question is about hit-testing. The
+two only agree by accident.
