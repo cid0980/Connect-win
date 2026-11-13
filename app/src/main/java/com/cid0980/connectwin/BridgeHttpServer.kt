@@ -440,8 +440,12 @@ class BridgeHttpServer(
                         "hold" -> {
                             val x = st.getInt("x"); val y = st.getInt("y")
                             val holdMs = st.optLong("duration_ms", 400L).coerceIn(20L, 10_000L)
-                            JSONObject().put("ok", requireA11y().press(x, y, holdMs))
-                                .put("held_ms", holdMs).put("at", JSONArray(listOf(x, y)))
+                            val ptr = st.optInt("pointer", 0)
+                            val a11yHold = requireA11y()
+                            a11yHold.touchPress(ptr, x, y, holdMs)
+                            JSONObject().put("ok", true)
+                                .put("held_ms", holdMs).put("pointer", ptr)
+                                .put("at", JSONArray(listOf(x, y)))
                         }
                         // NEW (game path): press -> drag through waypoints -> release, in a
                         // single dispatched gesture. Waypoints are [x,y] pairs. This is the
