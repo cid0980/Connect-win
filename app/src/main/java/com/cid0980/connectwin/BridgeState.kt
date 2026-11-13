@@ -23,7 +23,7 @@ data class BridgeSnapshot(
 )
 
 object BridgeState {
-    const val VERSION = "1.5.0"
+    const val VERSION = "1.6.0"
     const val HTTP_PORT = 8765
     private const val PREFS_NAME = "connect_win_prefs"
     private const val KEY_TOKEN = "bridge_token"
@@ -32,6 +32,7 @@ object BridgeState {
     private const val KEY_TUNNEL_PROTOCOL = "tunnel_protocol"
     private const val KEY_AUTO_BOOT = "auto_start_boot"
     private const val KEY_WAS_RUNNING = "was_running"
+    private const val KEY_CAPTURE_WANTED = "capture_wanted"
 
     private val _snapshot = MutableStateFlow(BridgeSnapshot())
     val snapshot: StateFlow<BridgeSnapshot> = _snapshot
@@ -45,6 +46,27 @@ object BridgeState {
     private fun prefs(ctx: Context): SharedPreferences =
         ctx.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /**
+     * "The operator wants fast capture running." Distinct from "fast capture is
+     * running", which additionally requires live MediaProjection consent that only
+     * the on-device user can grant. Persisted so a restart can surface the mismatch
+     * instead of silently degrading to slow screenshots.
+     */
+    @Volatile
+    var captureWanted: Boolean = false
+        set(value) {
+            field = value
+            appContext?.let { prefs(it).edit().putBoolean(KEY_CAPTURE_WANTED, value).apply() }
+        }
+
+    @Volatile
+    private var appContext: Context? = null
+
+    fun loadCaptureWanted(ctx: Context) {
+        appContext = ctx.applicationContext
+        captureWanted = prefs(ctx).getBoolean(KEY_CAPTURE_WANTED, false)
+    }
+
     fun init(ctx: Context) {
         val dir = File(ctx.applicationContext.filesDir, "bridge")
         if (!dir.exists()) dir.mkdirs()
@@ -57,6 +79,7 @@ object BridgeState {
             }
         }
         getOrCreateToken(ctx)
+        loadCaptureWanted(ctx)
     }
 
     fun getOrCreateToken(ctx: Context): String {

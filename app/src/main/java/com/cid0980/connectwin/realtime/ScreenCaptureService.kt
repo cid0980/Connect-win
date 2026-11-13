@@ -138,6 +138,7 @@ class ScreenCaptureService : Service() {
         createVirtualDisplay()
         registerRotationListener()
         instance = this
+        BridgeState.captureWanted = true
         BridgeState.log("Capture: MediaProjection live (max_width=$maxWidth, fps=$fps)")
     }
 
@@ -157,16 +158,38 @@ class ScreenCaptureService : Service() {
         val h = (real.y * scale).toInt().coerceAtLeast(2)
         val dpi = (resources.displayMetrics.densityDpi * scale).toInt().coerceAtLeast(1)
 
-        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 4) // 2 -> 4: headroom so a slow consumer can't starve the producer
         reader.setOnImageAvailableListener({ ir ->
-            val img = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
+            // FIX (frame-rate bug): the fps throttle MUST NOT return from inside the
+            // try block. Doing so skipped the `finally { img.close() }`, leaking an
+            // ImageReader buffer per dropped frame. Once all slots (maxImages=2) were
+            // held, acquireLatestImage() returned null forever, so frameStore stopped
+            // publishing (~1.3 fps measured on-device instead of the configured 30).
+            // Now we always acquire and always close; throttling is a no-op decision
+            // that still releases the buffer.
+            val img = try {
+                ir.acquireLatestImage()
+            } catch (t: Throwable) {
+                null
+            } ?: return@setOnImageAvailableListener
             try {
                 val now = SystemClock.elapsedRealtime()
                 val minInterval = if (fps > 0) 1000L / fps else 0L
-                if (now - lastFrameAt < minInterval) return@setOnImageAvailableListener
+                if (now - lastFrameAt < minInterval) return@try   // <- finally still runs
                 lastFrameAt = now
-                val bmp = imageToBitmap(img) ?: return@setOnImageAvailableListener
+                val bmp = imageToBitmap(img) ?: return@try
                 frameStore.publish(bmp)
+                val publishedAt = SystemClock.elapsedRealtime()
+                // Instrumentation: capture->publish cost, and resolution of any
+                // pending dispatch->seen measurements against this new frame.
+                LatencyStats.onPublished(now, publishedAt)
+                if (LatencyStats.pendingCount() > 0) {
+                    LatencyStats.signature(bmp)?.let { sig ->
+                        LatencyStats.onFrameSignature(
+                            sig, bmp.width, bmp.height, publishedAt
+                        )
+                    }
+                }
                 ReflexEngine.onFrame()
             } catch (t: Throwable) {
                 BridgeState.log("Capture frame error: ${t.javaClass.simpleName}")

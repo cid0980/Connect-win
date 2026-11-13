@@ -928,10 +928,27 @@ object PhoneController {
             return JSONObject().put("ok", false).put("error", "Timed out after ${timeoutSec}s — use /jobs/start for long commands")
         }
         val out = proc.inputStream.bufferedReader().readText().take(25_000)
+        val code = proc.exitValue()
         return JSONObject().apply {
-            put("ok", proc.exitValue() == 0)
-            put("exit_code", proc.exitValue())
-            put("result", out + "\n(exit code: ${proc.exitValue()})")
+            put("ok", code == 0)
+            put("exit_code", code)
+            put("result", out + "\n(exit code: $code)")
+            // FIX (honesty): this shell runs as the app's own uid (u0_aXXX), NOT as
+            // `shell`. Anything requiring shell identity (pm, am, cmd, settings, logcat)
+            // fails with a SecurityException while still exiting 0, so agents saw
+            // "ok": true and a success-shaped payload. Surface the identity and flag a
+            // denied command so callers can stop trusting the exit code blindly.
+            put("uid", android.os.Process.myUid())
+            put("privileged", false)
+            if (out.contains("SecurityException") || out.contains("Permission denial")) {
+                put("ok", false)
+                put("denied", true)
+                put(
+                    "hint",
+                    "Denied: bridge shell runs as the app uid, not `shell`. " +
+                        "Use the dedicated endpoints (/apps, /status, /files/*) instead of pm/am/cmd."
+                )
+            }
         }
     }
 

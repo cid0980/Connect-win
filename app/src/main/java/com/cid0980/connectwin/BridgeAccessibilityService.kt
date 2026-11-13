@@ -19,6 +19,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import com.cid0980.connectwin.realtime.LatencyStats
+import com.cid0980.connectwin.realtime.ScreenCaptureService
 
 class BridgeAccessibilityService : AccessibilityService() {
 
@@ -480,9 +482,96 @@ class BridgeAccessibilityService : AccessibilityService() {
     // ==================================================================
     // GESTURE ENGINE (TAP, LONG-PRESS, SWIPE, PINCH, GLOBAL ACTIONS)
     // ==================================================================
+    /**
+     * Dispatch a gesture and report whether the screen actually changed.
+     *
+     * This exists because `dispatchGesture` returning true only means Android accepted
+     * the intent. A tap that lands on a loading overlay, a modal, or dead space returns
+     * true and does nothing, which is the single most common cause of automation that
+     * "works" but ends up somewhere unintended.
+     *
+     * @return effect: "changed" | "unchanged" | "unknown", plus latency_ms when a
+     *         change was measured, or a reason describing why no verdict is possible.
+     */
+    fun dispatchAndVerify(
+        gesture: GestureDescription,
+        what: String,
+        timeoutMs: Long = 8000L,
+        waitMs: Long = 400L
+    ): JSONObject {
+        // dispatchGestureSync registers the measurement (it holds the baseline frame),
+        // so here we only watch for that series growing. Registering a second one would
+        // double-count every verified tap.
+        val captureRunning = ScreenCaptureService.isRunning()
+        val before = LatencyStats.report().inputLatency.count
+        val dispatched = dispatchGestureSync(gesture, timeoutMs)
+        val res = JSONObject()
+        res.put("dispatched", dispatched)
+        if (!dispatched) {
+            res.put("effect", "unchanged")
+            res.put("reason", "gesture_rejected")
+            return res
+        }
+        if (!captureRunning) {
+            res.put("effect", "unknown")
+            res.put("reason", "fast_capture_off")
+            res.put(
+                "hint",
+                "Start fast capture (MediaProjection) to verify input; " +
+                    "accessibility screenshots are too slow to time."
+            )
+            return res
+        }
+        // Poll for a settled measurement rather than sleeping a fixed time.
+        val deadline = android.os.SystemClock.elapsedRealtime() + waitMs
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            val rep = LatencyStats.report()
+            if (rep.inputLatency.count > before) {
+                res.put("effect", "changed")
+                res.put("latency_ms", rep.inputLatency.max)
+                res.put("sample", what)
+                return res
+            }
+            try {
+                Thread.sleep(15L)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        // No frame registered a change. Only claim "unchanged" if we actually had
+        // frames to look at; otherwise we cannot distinguish "nothing happened"
+        // from "capture is stalled".
+        val rep = LatencyStats.report()
+        val age = ScreenCaptureService.frameStore.ageMs()
+        if (age in 0L..1500L) {
+            res.put("effect", "unchanged")
+            res.put("reason", "no_pixel_change")
+        } else {
+            res.put("effect", "unknown")
+            res.put("reason", "stale_or_no_frames")
+            res.put("frame_age_ms", ScreenCaptureService.frameStore.ageMs())
+        }
+        return res
+    }
+
     private fun dispatchGestureSync(gesture: GestureDescription, timeoutMs: Long = 8000L): Boolean {
         val latch = CountDownLatch(1)
         var completed = false
+        // Register an input-latency measurement before the gesture goes out so the
+        // very next changed frame resolves it. Only when fast capture is live: the
+        // accessibility screenshot path is far too slow to time an input.
+        if (ScreenCaptureService.isRunning()) {
+            ScreenCaptureService.frameStore.use { bmp ->
+                LatencyStats.onDispatch(
+                    "gesture",
+                    LatencyStats.signature(bmp),
+                    bmp.width,
+                    bmp.height,
+                    android.os.SystemClock.elapsedRealtime()
+                )
+            }
+        }
         val dispatched = dispatchGesture(
             gesture,
             object : GestureResultCallback() {
@@ -498,7 +587,10 @@ class BridgeAccessibilityService : AccessibilityService() {
             },
             null
         )
-        if (!dispatched) return false
+        if (!dispatched) {
+            LatencyStats.cancelDispatch()
+            return false
+        }
         latch.await(timeoutMs, TimeUnit.MILLISECONDS)
         return completed
     }
@@ -529,6 +621,33 @@ class BridgeAccessibilityService : AccessibilityService() {
         val p = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val stroke = GestureDescription.StrokeDescription(p, 0L, durationMs.coerceIn(20L, 2000L))
         return dispatchGestureSync(GestureDescription.Builder().addStroke(stroke).build())
+    }
+
+    /**
+     * Press at the first point, drag through every waypoint, release — one gesture,
+     * one dispatch. For game/camera control this replaces N individual swipes and
+     * avoids the finger lifting between segments (which cancels pan/drag in most
+     * engines and makes virtual joysticks snap back to centre).
+     *
+     * @param points flattened [x0,y0, x1,y1, ...], 2..40 waypoints, integer display px.
+     */
+    fun dragPath(points: IntArray, durationMs: Long = 500L): Boolean {
+        require(points.size >= 4 && points.size % 2 == 0) {
+            "dragPath needs at least 2 [x,y] points"
+        }
+        require(points.size / 2 <= 40) { "Maximum 40 waypoints" }
+        val path = Path().apply {
+            moveTo(points[0].toFloat(), points[1].toFloat())
+            var i = 2
+            while (i < points.size) {
+                lineTo(points[i].toFloat(), points[i + 1].toFloat())
+                i += 2
+            }
+        }
+        val stroke = GestureDescription.StrokeDescription(
+            path, 0L, durationMs.coerceIn(50L, 10_000L)
+        )
+        return dispatchGestureSync(GestureDescription.Builder().addStroke(stroke).build(), 12_000L)
     }
 
     fun longPress(x: Int, y: Int, durationMs: Long = 550L): Boolean =

@@ -57,6 +57,14 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
     private val tickCount = AtomicLong(0)
     private val moveCount = AtomicLong(0)
     private var generationCounter = 0L
+    private var dispatchRetry = 0
+    // Cancellation observability. Android cancels a gesture whenever the foreground
+    // app reclaims the touch, a window changes, or an overlay appears — which in a
+    // game is routine, not exceptional. Without counters an agent cannot distinguish
+    // "my dodge missed" from "the game ate my input".
+    private val cancelsTotal = AtomicLong(0)
+    private var cancelsThisTick = 0
+    @Volatile private var lastCancelReason: String? = null
 
     // Screen size is queried from WindowManager; cache it so a 60 Hz move stream
     // does not make a binder call per event. Refreshed on down and periodically.
@@ -155,6 +163,8 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
             put("tick_ms", tickMs)
             put("ticks", tickCount.get())
             put("moves", moveCount.get())
+            put("cancels", cancelsTotal.get())
+            put("last_cancel_reason", lastCancelReason ?: JSONObject.NULL)
             put("pointers", arr)
         }
     }
@@ -209,8 +219,13 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
         for (p in pointers.values) {
             val path = Path().apply {
                 moveTo(p.x, p.y)
-                // A tiny path even when stationary keeps the finger "down".
-                lineTo(p.tx, p.ty)
+                // FIX (held-finger bug): a zero-length path makes Android treat the
+                // stroke as a *tap* and auto-release it, which killed every held
+                // joystick/aim finger after ~4 ticks regardless of tick_ms.
+                // A stationary finger must still advance by a sub-pixel amount so
+                // the gesture stays "in progress" and continueStroke keeps it down.
+                if (p.tx == p.x && p.ty == p.y) lineTo(p.x + 0.01f, p.y + 0.01f)
+                else lineTo(p.tx, p.ty)
             }
             val willContinue = !p.releasing
             val stroke = try {
@@ -242,9 +257,14 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
 
         if (!ok) {
             dispatching = false
-            // Could not dispatch (service busy). Retry shortly without advancing.
-            handler.postDelayed({ dispatchTick() }, 8L)
+            // FIX (dispatch throttle): retry with exponential backoff. The previous
+            // fixed 8 ms retry meant a busy gesture pipeline (exactly the case during
+            // real gameplay) burned CPU without ever succeeding, starving the loop.
+            dispatchRetry = (dispatchRetry + 1).coerceAtMost(6)
+            handler.postDelayed({ dispatchTick() }, 8L * (1L shl (dispatchRetry - 1)))
+            return
         }
+        dispatchRetry = 0
     }
 
     private fun onTickDone(completed: Boolean) {
@@ -253,11 +273,34 @@ class ContinuousTouchEngine(private val service: AccessibilityService) {
         tickCount.incrementAndGet()
 
         if (!completed) {
-            // Gesture cancelled by the system/app: drop all fingers to avoid a stuck touch.
-            pointers.clear()
-            running = false
+            cancelsTotal.incrementAndGet()
+            cancelsThisTick++
+            if (cancelsThisTick >= 2) {
+                // Two consecutive cancelled dispatches means the system is actively
+                // refusing input (app consumed the touch, window change, overlay, or
+                // the service lost the gesture pipeline). Only then drop everything —
+                // this keeps the "never leave a stuck finger on the device" guarantee
+                // without destroying a multi-finger setup over one transient cancel.
+                lastCancelReason = "consecutive_cancel"
+                BridgeState.log("Touch: consecutive cancels, releasing all pointers")
+                pointers.clear()
+                running = false
+                return
+            }
+            // Single cancel: retry this tick immediately. prev strokes are invalid now
+            // because Android cancelled them, so restart each pointer from its target
+            // position with a fresh StrokeDescription rather than a continueStroke.
+            lastCancelReason = "stroke_cancelled"
+            for (p in pointers.values) {
+                p.prev = null
+                p.x = p.tx
+                p.y = p.ty
+            }
+            dispatchTick()
             return
         }
+        cancelsThisTick = 0
+        lastCancelReason = null
 
         val it = pointers.entries.iterator()
         while (it.hasNext()) {

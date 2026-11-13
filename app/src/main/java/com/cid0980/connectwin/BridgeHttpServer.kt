@@ -122,6 +122,18 @@ class BridgeHttpServer(
         put("height", ScreenCaptureService.frameStore.height)
         put("frame_age_ms", ScreenCaptureService.frameStore.ageMs())
         put("source", if (ScreenCaptureService.isRunning()) "mediaprojection" else "accessibility")
+        // wanted vs running: a mismatch means the user asked for fast capture but
+        // MediaProjection consent was lost (app restart, rotation, config change).
+        // Without this, an agent silently falls back to the slow screenshot path and
+        // concludes the phone is broken rather than unconsented.
+        put("wanted", BridgeState.captureWanted)
+        if (BridgeState.captureWanted && !ScreenCaptureService.isRunning()) {
+            put(
+                "warning",
+                "fast capture is wanted but not running — tap 'Enable fast capture' in " +
+                    "the Connect-win app to re-grant MediaProjection consent"
+            )
+        }
     }
 
     private fun activityJson(s: AgentActivityTracker.Snapshot): JSONObject = JSONObject().apply {
@@ -419,6 +431,36 @@ class BridgeHttpServer(
                             JSONObject().put("ok", true).put("slept_ms", ms)
                         }
                         "ui_state" -> requireA11y().uiStateJson().put("ok", true)
+                        // NEW (game path): hold a finger at a point for a duration, then
+                        // release. Distinct from `click` (a tap) and `swipe` (a one-shot
+                        // linear gesture): this keeps the finger DOWN the whole time, which
+                        // is what virtual joysticks / aim sticks / "press and hold" buttons
+                        // require. Previously an agent had to interleave `touch` down/up
+                        // steps and hope the batch kept them alive.
+                        "hold" -> {
+                            val x = st.getInt("x"); val y = st.getInt("y")
+                            val holdMs = st.optLong("duration_ms", 400L).coerceIn(20L, 10_000L)
+                            JSONObject().put("ok", requireA11y().press(x, y, holdMs))
+                                .put("held_ms", holdMs).put("at", JSONArray(listOf(x, y)))
+                        }
+                        // NEW (game path): press -> drag through waypoints -> release, in a
+                        // single dispatched gesture. Waypoints are [x,y] pairs. This is the
+                        // primitive an agent needs for camera pans, sliders and joystick
+                        // vectors without 60 HTTP round-trips per second.
+                        "drag_path" -> {
+                            val pts = st.optJSONArray("points")
+                                ?: throw IllegalArgumentException("Missing points [[x,y],...]")
+                            require(pts.length() in 2..40) { "drag_path needs 2..40 points" }
+                            val flat = IntArray(pts.length() * 2)
+                            for (k in 0 until pts.length()) {
+                                val pair = pts.getJSONArray(k)
+                                flat[k * 2] = pair.getInt(0)
+                                flat[k * 2 + 1] = pair.getInt(1)
+                            }
+                            JSONObject()
+                                .put("ok", requireA11y().dragPath(flat, st.optLong("duration_ms", 500L)))
+                                .put("waypoints", pts.length())
+                        }
                         "touch" -> {
                             val a11y = requireA11y()
                             val p = st.optInt("pointer", 0)
@@ -674,7 +716,29 @@ class BridgeHttpServer(
             val x = b.getInt("x")
             val y = b.getInt("y")
             val dur = b.optLong("duration_ms", if (path == "/gui/click2") 110L else 55L)
-            val okTap = requireA11y().tap(x, y, dur)
+            val a11y = requireA11y()
+            // verify=1: report whether the screen actually changed, not just that
+            // Android accepted the touch. A tap can return true while doing nothing
+            // (loading overlay, modal, dead space) — that ambiguity is what makes remote
+            // automation wander off. Opt-in so the unverified hot path stays cheap.
+            if (b.optBoolean("verify", false)) {
+                val gp = android.graphics.Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+                val g = android.accessibilityservice.GestureDescription.Builder()
+                    .addStroke(
+                        android.accessibilityservice.GestureDescription.StrokeDescription(gp, 0L, dur)
+                    )
+                    .build()
+                val res = a11y.dispatchAndVerify(
+                    g,
+                    path.removePrefix("/gui/").removePrefix("/"),
+                    waitMs = b.optLong("wait_ms", 400L)
+                )
+                return ok(
+                    res.put("ok", res.optBoolean("dispatched"))
+                        .put("clicked", JSONArray(listOf(x, y)))
+                )
+            }
+            val okTap = a11y.tap(x, y, dur)
             return ok(JSONObject().put("ok", okTap).put("clicked", JSONArray(listOf(x, y))))
         }
 
@@ -1026,8 +1090,58 @@ class BridgeHttpServer(
             return ok(JSONObject().put("ok", true).put("t", System.currentTimeMillis()))
         }
 
+        // Latency percentiles for the realtime stack. This is the number that decides
+        // whether a real-time game is playable: dispatch->seen is the time from
+        // "gesture accepted" to "a frame shows a visible difference".
+        //   POST /bench/latency/reset  clear samples
+        //   GET  /bench/latency        read percentiles
+        if (path == "/bench/latency/reset" && method == Method.POST) {
+            com.cid0980.connectwin.realtime.LatencyStats.reset()
+            return ok(JSONObject().put("ok", true).put("reset", true))
+        }
+
+        if (path == "/bench/latency" && method == Method.GET) {
+            val rep = com.cid0980.connectwin.realtime.LatencyStats.report()
+            val capture = ScreenCaptureService.isRunning()
+            val seqBefore = ScreenCaptureService.frameStore.seq
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            // Window for the fps probe; short enough not to block the client badly.
+            val probeMs = (q(session, "probe_ms")?.toLongOrNull() ?: 500L).coerceIn(100L, 5000L)
+            if (capture) {
+                Thread.sleep(probeMs)
+            }
+            val elapsed = android.os.SystemClock.elapsedRealtime() - t0
+            val frames = ScreenCaptureService.frameStore.seq - seqBefore
+            val fps = if (elapsed > 0) frames * 1000.0 / elapsed else 0.0
+            return ok(JSONObject().apply {
+                put("ok", true)
+                put("capture_running", capture)
+                put("source", if (capture) "mediaprojection" else "accessibility")
+                put("capture_to_publish_ms", rep.captureToPublish.toJson())
+                put("dispatch_to_seen_ms", rep.inputLatency.toJson())
+                put("compared_frames", rep.comparedFrames)
+                put("timed_out_inputs", rep.timedOutInputs)
+                put("pending", rep.pending)
+                put("probe_ms", elapsed)
+                put("frames_in_probe", frames)
+                put("fps", Math.round(fps * 10.0) / 10.0)
+                if (!capture) put(
+                    "note",
+                    "fast capture is off: latencies will be empty and accuracy is " +
+                        "limited to accessibility screenshots (~450-550 ms per frame)"
+                )
+            })
+        }
+
         if (path == "/capture/status" && method == Method.GET) {
             return ok(captureStatusJson())
+        }
+
+        if (path == "/capture/wanted" && method == Method.POST) {
+            val b = readJson(session)
+            val want = b.optBoolean("wanted", true)
+            BridgeState.captureWanted = want
+            return ok(JSONObject().put("ok", true).put("wanted", want))
         }
 
         if (path == "/capture/start" && method == Method.POST) {
@@ -1037,6 +1151,7 @@ class BridgeHttpServer(
         }
 
         if (path == "/capture/stop" && method == Method.POST) {
+            BridgeState.captureWanted = false
             ScreenCaptureService.stop(context)
             return ok(JSONObject().put("ok", true).put("running", false))
         }

@@ -31,6 +31,42 @@ Built for seamless agent control and game-style tasks, so the only real delay is
 See **[REALTIME.md](REALTIME.md)** for the full API, reflex examples, and tuning tips. A desktop
 `Connect-win-agent.exe` is built by GitHub Actions and attached to the latest release.
 
+### v1.6.0 — measurement, honest input, resilient fingers
+
+This release is deliberately about **knowing what the bridge actually costs**, because
+every previous claim about latency was an estimate.
+
+- **`GET /bench/latency`** — p50/p95/max for two series:
+  `capture→publish` (capture-thread cost) and **`dispatch→seen`** (time from a gesture
+  being accepted to a frame showing a visible difference). That last number is the one
+  that decides whether a real-time game is playable. Includes a live `fps` probe.
+  `POST /bench/latency/reset` clears samples.
+- **`verify: true` on `/gui/click`** — returns
+  `{"effect": "changed" | "unchanged" | "unknown", "latency_ms": …}` instead of merely
+  `ok: true`. A tap that lands on a loading overlay, a modal, or dead space used to be
+  indistinguishable from a successful one; that ambiguity is the most common cause of
+  automation that appears to work but ends up somewhere unintended. Returns `unknown`
+  (not a lie) when fast capture is off.
+- **Per-pointer gesture-cancel recovery** — a single cancelled stroke no longer releases
+  *every* held finger. It rebuilds the affected stroke from its target position and keeps
+  going; only two consecutive cancels (the system genuinely refusing input) release all
+  pointers. `/gui/touch` state now reports `cancels` and `last_cancel_reason`, so
+  "my dodge missed" is finally distinguishable from "the game ate my input".
+- **Frame-rate fix** — the fps throttle in the capture loop returned from inside `try`,
+  skipping `finally { img.close() }` and leaking an ImageReader buffer per dropped frame.
+  Once all slots were held, publishing stopped: **1.3 fps measured on-device against a
+  configured 30**. Buffers are now always closed and `maxImages` raised 2 → 4.
+- **Held-finger fix** — a stationary pointer produced a zero-length path, which Android
+  treats as a *tap* and auto-releases, killing held joystick/aim fingers within ~4 ticks
+  at any tick rate. Stationary strokes now advance by a sub-pixel amount.
+- **`capture.wanted`** — `/capture/status` distinguishes "the operator wants fast capture"
+  from "fast capture is running". Losing MediaProjection consent after a restart used to
+  degrade silently to slow screenshots; it now reports a `warning`.
+
+`dispatchGesture` remains capped at 10 s per stroke and can be cancelled by the app under
+test. See [docs/REALTIME-GENSHIN.md](docs/REALTIME-GENSHIN.md) for the measured latency
+budget and what it implies for real-time games.
+
 ### Agent activity notification (v1.5.0)
 
 The persistent bridge notification now shows whether the agent is **working / paused / finished / idle**,

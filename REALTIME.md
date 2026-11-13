@@ -51,6 +51,65 @@ The bridge notification is an honest progress indicator, not a guess:
 
 Without this, frames fall back to the rate-limited accessibility screenshot.
 
+## Measuring latency (v1.6.0)
+
+Every claim about "how fast is this" is now a measurement rather than an estimate.
+
+```bash
+H="X-Bridge-Token: $BRIDGE_TOKEN"
+# p50/p95/max for capture->publish and dispatch->seen, plus a live fps probe
+curl -s "$BRIDGE_URL/bench/latency?probe_ms=500" -H "$H"
+curl -s -X POST "$BRIDGE_URL/bench/latency/reset" -H "$H"
+```
+
+Response (abridged):
+
+```json
+{ "capture_running": true, "source": "mediaprojection",
+  "capture_to_publish_ms": { "count": 213, "p50": 31, "p95": 44, "max": 120 },
+  "dispatch_to_seen_ms":   { "count": 18,  "p50": 88, "p95": 140, "max": 260 },
+  "compared_frames": 240, "timed_out_inputs": 1, "pending": 0,
+  "probe_ms": 500, "frames_in_probe": 15, "fps": 30.0 }
+```
+
+Four timestamps are recorded per interaction:
+
+| Timestamp | Meaning |
+|---|---|
+| `capture` | ImageReader delivered a frame we chose to publish |
+| `publish` | `FrameStore.publish()` returned — frame now visible to consumers |
+| `dispatch` | `dispatchGesture()` accepted the stroke |
+| `seen` | first frame after dispatch whose 32×32 luminance grid differs by >2% |
+
+`dispatch→seen` is the number that matters for real-time control. It requires fast
+capture: the accessibility screenshot path is ~450–550 ms per frame and cannot time an
+input. `GET /bench/latency` reports `note` and leaves the series empty rather than
+inventing numbers when capture is off.
+
+### Verifying that an input did anything
+
+`dispatchGesture` returning `true` only means Android accepted the intent — a tap on a
+loading overlay or dead space returns `true` and does nothing. Ask for confirmation:
+
+```bash
+curl -s -X POST "$BRIDGE_URL/gui/click" -H "$H" \
+  -d '{"x":540,"y":1716,"verify":true,"wait_ms":400}'
+# {"ok":true,"dispatched":true,"effect":"changed","latency_ms":96}
+# {"ok":true,"dispatched":true,"effect":"unchanged","reason":"no_pixel_change"}
+# {"ok":true,"dispatched":true,"effect":"unknown","reason":"fast_capture_off"}
+```
+
+`unchanged` is only reported when a frame was actually available to look at; otherwise the
+answer is `unknown` with a reason. Opt-in, because it costs up to `wait_ms`.
+
+### Gesture cancellation
+
+Android cancels a stroke whenever the foreground app reclaims the touch, a window changes,
+or an overlay appears — routine in games. A single cancel now rebuilds the affected stroke
+from its target position and continues; only two consecutive cancels release all pointers
+(the "never leave a stuck finger" guarantee). `/gui/touch` state reports `cancels` and
+`last_cancel_reason`.
+
 ## Continuous touch
 HTTP:
 ```bash
