@@ -481,3 +481,104 @@ optional `size` check), but for anything large, fetch beats push.
 
 Generalisation: **any bulk transfer should be pull, not push.** The tunnel is a control
 channel, and it should only ever be asked to carry control-sized messages.
+
+## 11. MEASURED ON GENSHIN IMPACT — the target capability, end to end
+
+First contact with the actual target game (`com.miHoYo.GenshinImpact`), on the reference
+device, with v1.6.9.
+
+### It works
+
+The bridge controlled a real-time 3D game. Character movement via **continuous touch** — a
+held pointer on the left thumbstick at physical (280,800) with periodic `move` events —
+walked the character from the "Clear Pool and Mountain Cavern" doorway into open terrain. The
+joystick was visibly displaced and the camera/character state changed completely. This is the
+first evidence that the control primitives suit a real-time action game rather than menus.
+
+Genshin renders **landscape** (2400x1080) while the device is portrait, and reports it
+correctly in `/ui/state` `screen`. Any coordinate reasoning has to come from the live screen
+size, never from a portrait assumption.
+
+### The perception numbers are bad, and worse than predicted
+
+Prediction before testing was that a constantly-repainting 3D game would deliver *more*
+frames than a menu game that repaints only on state changes. **The opposite happened.**
+
+| Condition | frames arrived | published | source_fps |
+|---|---|---|---|
+| Genshin idle, static scene | 1.00 /s | 0.50 /s | 1.7 |
+| Genshin, joystick held (moving) | 1.38 /s | 0.50 /s | 1.7 |
+| Rent game idle (earlier) | ~1.4 /s | — | 1.6–2.2 |
+
+Moving the character — a full-screen, constantly changing 3D render — raised arrival from
+1.00 to 1.38 frames per second. That is the whole result. `image_available` (frames the
+VirtualDisplay handed to ImageReader) grows by 1–3 per second, `convert_failed` is 0, and
+`throttle_skipped` barely moves, so **the bottleneck is upstream of this app's code**: the
+VirtualDisplay is not delivering a real gameplay frame rate.
+
+`POST /capture/restart` did not fix it (published 0.25 -> 0.75/s), unlike the 1.6.1 stall
+where restart restored 0.6 -> 8 fps. So this is a different phenomenon: not a stalled
+pipeline that a restart unblocks, but a hard cap on what the capture path receives.
+
+### Frame fetch latency, and where the time actually goes
+
+Full round trip from here to the phone and back, live Genshin scene:
+
+| Payload | p50 |
+|---|---|
+| 720px q70 (42,623 B) | 319 ms |
+| 540px q70 (25,214 B) | 425 ms |
+| 360px q50 (9,715 B) | 325 ms |
+| 240px q40 (4,968 B) | 315 ms |
+| 180px q30 (2,867 B) | 297 ms |
+
+A 15x reduction in bytes buys ~30 ms. **Latency is fixed overhead, not bandwidth** — the same
+conclusion as the earlier Rent-game measurement, now confirmed on the target game. There is no
+payload size at which this becomes real-time.
+
+### End-to-end reaction time in Genshin
+
+Tap, then poll until the returned frame differs:
+
+```
+trial 1: change seen at 2944 ms
+trial 2: change seen at 2684 ms
+trial 3: change seen at 1247 ms
+```
+
+Even accounting for polling granularity, **~1.2–2.9 s from tap to observable change.** At
+~1.4 frames/s arriving, the next frame after any action is on average ~350 ms away and can be
+~700 ms; the tap itself must survive the tunnel (~300 ms each way), which is ~600 ms before
+the gesture is even dispatched.
+
+### Verdict against the stated goal
+
+The goal was "seamless like a human using the mobile", with Genshin as the capability ceiling.
+The honest assessment, per layer:
+
+| Layer | Verdict |
+|---|---|
+| Perception of menus/static UI | **fine** — 300 ms round trip is ample |
+| Control primitives (tap, hold, joystick, multi-touch) | **fine** — proven working in a 3D game |
+| Perception of real-time 3D | **not usable** — 1.4 fps, ~1.2–2.9 s to see one's own action |
+| Remote reactive play | **impossible** — a dodge needs ~200 ms, the loop is ~1500 ms |
+| On-device reflex rules | **the only viable path**, and currently starved of input |
+
+The reflex engine was the right architecture. It is being fed 1.4 frames per second, so a
+rule that must react within 200 ms is working from data up to 700 ms stale before it even
+evaluates. **No amount of rule sophistication fixes a starved sensor.**
+
+### The open engineering question
+
+Why does the VirtualDisplay deliver ~1.4 fps in Genshin? Candidates, in order of likelihood:
+
+1. The virtual display is a *second* display compositing a landscape game while the phone is
+   physically portrait, and is being throttled.
+2. MediaProjection is de-prioritised while a GPU-saturated 3D game has the foreground.
+3. `max_width` 720 on a 2400x1080 landscape surface forces an expensive scale on the
+   producer side, so the *producer* drops frames before ImageReader ever sees them.
+
+Candidate 3 is testable and cheap: re-measure arrival rate at `max_width` 1600/1080/native
+instead of 720. If arrival climbs with a larger requested width, the scaling is the cause and
+the fix is to capture at native and downscale on the consumer side. That is the next
+measurement to run, and it decides whether on-device reflexes have any future at all.
