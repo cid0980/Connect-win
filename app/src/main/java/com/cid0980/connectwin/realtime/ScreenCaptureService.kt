@@ -63,6 +63,7 @@ class ScreenCaptureService : Service() {
         private val convertFailCount = java.util.concurrent.atomic.AtomicLong(0)
         private val publishCount = java.util.concurrent.atomic.AtomicLong(0)
         private val exceptionCount = java.util.concurrent.atomic.AtomicLong(0)
+        private val startedAtMs = android.os.SystemClock.elapsedRealtime()
 
         /** Snapshot for /capture/status. Resets nothing; counters are monotonic. */
         fun diagnostics(): org.json.JSONObject = org.json.JSONObject().apply {
@@ -72,20 +73,38 @@ class ScreenCaptureService : Service() {
             put("convert_failed", convertFailCount.get())
             put("published", publishCount.get())
             put("exceptions", exceptionCount.get())
-            // Verdict: the single most likely explanation, in plain words.
+            // Verdict, in plain words. Thresholds matter here: an earlier version
+            // called 13 skipped frames out of 98 "most are dropped", which pointed at
+            // the fps cap when the real issue was that the display was only delivering
+            // 0.6 frames/s. Distinguish "the source is slow" from "we are dropping".
+            val img = imageAvailableCount.get()
+            val acq = acquiredCount.get()
+            val thr = throttleSkipCount.get()
+            val conv = convertFailCount.get()
+            val pub = publishCount.get()
+            val observableSeconds = (android.os.SystemClock.elapsedRealtime() - startedAtMs) / 1000.0
+            val imgRate = if (observableSeconds > 0) img / observableSeconds else 0.0
+            put("source_fps", Math.round(imgRate * 10.0) / 10.0)
             put(
                 "verdict",
                 when {
-                    imageAvailableCount.get() == 0L ->
+                    img == 0L ->
                         "no_frames_from_display — the virtual display is not producing " +
                             "frames at all (re-grant MediaProjection consent)"
-                    acquiredCount.get() == 0L ->
+                    acq == 0L ->
                         "acquire_failing — listener fires but buffers are not being acquired"
-                    convertFailCount.get() > 0L && convertFailCount.get() == acquiredCount.get() ->
+                    conv > 0L && conv >= acq ->
                         "conversion_failing — every acquired frame fails to convert"
-                    throttleSkipCount.get() in 1 until (acquiredCount.get() / 2) ->
-                        "throttled — frames arrive but most are dropped by the fps cap"
-                    publishCount.get() > 0L -> "publishing"
+                    // Below ~5 fps the display is the limit; the fps cap cannot be blamed.
+                    imgRate < 5.0 ->
+                        "slow_source — display is delivering only " +
+                            "${Math.round(imgRate * 10.0) / 10.0} fps. Either the screen is " +
+                            "static (normal: MediaProjection sends nothing when nothing " +
+                            "changes) or the pipeline has stalled — try POST /capture/restart"
+                    thr > 0L && thr * 3 > acq ->
+                        "throttled — over a third of arriving frames are dropped by the " +
+                            "fps cap; raise fps if the app can sustain it"
+                    pub > 0L -> "publishing"
                     else -> "idle"
                 }
             )
