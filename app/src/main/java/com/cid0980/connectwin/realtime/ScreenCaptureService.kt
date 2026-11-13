@@ -172,25 +172,31 @@ class ScreenCaptureService : Service() {
             } catch (t: Throwable) {
                 null
             } ?: return@setOnImageAvailableListener
+            // `run` gives the block a name we can return from, which is what the
+            // original bug needed: `try` in Kotlin is not a lambda, so you cannot
+            // `return@try` to skip work while still running `finally`. Escaping the
+            // throttle must not skip img.close().
             try {
-                val now = SystemClock.elapsedRealtime()
-                val minInterval = if (fps > 0) 1000L / fps else 0L
-                if (now - lastFrameAt < minInterval) return@try   // <- finally still runs
-                lastFrameAt = now
-                val bmp = imageToBitmap(img) ?: return@try
-                frameStore.publish(bmp)
-                val publishedAt = SystemClock.elapsedRealtime()
-                // Instrumentation: capture->publish cost, and resolution of any
-                // pending dispatch->seen measurements against this new frame.
-                LatencyStats.onPublished(now, publishedAt)
-                if (LatencyStats.pendingCount() > 0) {
-                    LatencyStats.signature(bmp)?.let { sig ->
-                        LatencyStats.onFrameSignature(
-                            sig, bmp.width, bmp.height, publishedAt
-                        )
+                run throttled@{
+                    val now = SystemClock.elapsedRealtime()
+                    val minInterval = if (fps > 0) 1000L / fps else 0L
+                    if (now - lastFrameAt < minInterval) return@throttled
+                    lastFrameAt = now
+                    val bmp = imageToBitmap(img) ?: return@throttled
+                    frameStore.publish(bmp)
+                    val publishedAt = SystemClock.elapsedRealtime()
+                    // Instrumentation: capture->publish cost, and resolution of any
+                    // pending dispatch->seen measurements against this new frame.
+                    LatencyStats.onPublished(now, publishedAt)
+                    if (LatencyStats.pendingCount() > 0) {
+                        LatencyStats.signature(bmp)?.let { sig ->
+                            LatencyStats.onFrameSignature(
+                                sig, bmp.width, bmp.height, publishedAt
+                            )
+                        }
                     }
+                    ReflexEngine.onFrame()
                 }
-                ReflexEngine.onFrame()
             } catch (t: Throwable) {
                 BridgeState.log("Capture frame error: ${t.javaClass.simpleName}")
             } finally {
