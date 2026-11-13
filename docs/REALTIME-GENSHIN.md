@@ -568,6 +568,58 @@ The reflex engine was the right architecture. It is being fed 1.4 frames per sec
 rule that must react within 200 ms is working from data up to 700 ms stale before it even
 evaluates. **No amount of rule sophistication fixes a starved sensor.**
 
+### CORRECTION (same day): the 1.4 fps figure was wrong
+
+An earlier version of this document concluded Genshin delivers ~1.4 frames/s even while
+moving, and that restart does not help. **That was a measurement error, and it mattered.**
+
+Re-measured with the device awake, Genshin in the foreground and reconnected, and capture
+started by the operator:
+
+| Test | Result |
+|---|---|
+| joystick held, 12 s | **7.42 fps arriving** |
+| idle, no input, 12 s | **8.42 fps arriving** |
+| A/B native 2400 vs 720, joystick held, 4x15 s | 7.60 / 7.47 / 6.40 / 6.40 fps |
+| sustained 1080, 3 minutes | 8.35, 9.20, 9.70, 9.55, 9.45, 9.60, 8.30, 9.20 fps |
+| sustained 1080, frame_age | **p50 66 ms, p95 601 ms** |
+| sustained 2400, frame_age | p50 197 ms, p95 379 ms |
+
+So Genshin runs around **9 fps**, essentially the same as the 2D Rent game's 8 fps. The
+"3D games are much worse" hypothesis is dead, and so is "capture width is the bottleneck" —
+native 2400 and 720 deliver the same rate, so the VirtualDisplay is not scaling-bound.
+
+The 1.4 fps readings came from a device that had been sitting with a dead capture session
+(`running:false`) and a backgrounded game; `/capture/status` kept reporting the *last* counter
+values it held, which looked like a live but starved pipeline. This is the third instance of
+the same class of error in this project: **a stale sensor read as a live one.** Hence the
+fix list below.
+
+### What is actually true
+
+1. **~9 fps arrives at any capture width.** fps=30 is never reached, but 9 is enough for
+   on-device reflexes at a 110 ms detection cadence.
+2. **`published` is roughly half of `arrived` (~4.4/s).** The app drops every second frame
+   somewhere between acquire and publish. Unknown cause, and it is free performance.
+3. **frame_age p50 is 66 ms**, so the frame store is fresh and usable for reflexes. The p95 of
+   601 ms reflects static periods where the display sends nothing — which is normal and is
+   already what `slow_source` describes.
+4. **Bitrate at 720 is ~20-25 KB/frame**, so 9 fps is ~200 KB/s. The tunnel cannot carry that
+   continuously, but it does not need to: reflexes run on-device and only decisions cross.
+
+### Verdict, revised
+
+| Layer | Verdict |
+|---|---|
+| Perception of menus/static UI | fine |
+| Control primitives in a 3D game | **proven working** |
+| Perception of real-time 3D | **~9 fps, p50 frame_age 66 ms — workable for on-device reflexes** |
+| Remote reactive play | still impossible: ~1500 ms round trip measured |
+| On-device reflex rules | **viable, and now fed properly** |
+
+The architecture was right. My measurement was wrong, and I nearly wrote off the target
+because of it.
+
 ### The open engineering question
 
 Why does the VirtualDisplay deliver ~1.4 fps in Genshin? Candidates, in order of likelihood:
