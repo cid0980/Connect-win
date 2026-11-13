@@ -364,3 +364,35 @@ M0 is small and decides everything. My strong recommendation: **do M0, re-run th
 bench, and only then decide how far to go** — because if `dispatch→seen` comes back at
 300 ms even on-device, the honest answer for Genshin changes and the effort should go into
 turn-based seamlessness instead.
+
+---
+
+## Appendix — tunnel reliability, measured
+
+Between 11 and 13 Nov 2026 the Quick Tunnel was used continuously for roughly six hours
+of play and development. It went down **five times**, and the failure modes are worth
+recording because they cost real time each occurrence:
+
+| # | Symptom | Cause | Recovery |
+|---|---|---|---|
+| 1 | HTTP 530, error 1033 | `cloudflared` process gone | new URL from phone |
+| 2 | HTTP 530, error 1033 | app restarted | new URL from phone |
+| 3 | HTTP 530, error 1033 | app restarted | new URL from phone |
+| 4 | name resolution failure | tunnel record removed | new URL from phone |
+| 5 | HTTP 530, error 1033 | app restarted | new URL from phone |
+
+Each recovery required a human to open the app and copy a new URL, because a Quick
+Tunnel mints a fresh hostname every time. Two of the five happened mid-task, which means
+any long-running operation through this bridge must assume the control plane can vanish
+without warning.
+
+This is not a defect in the bridge code — it is the documented behaviour of Quick
+Tunnels, and `bridge-observations.md` §7 already predicted it. It is listed here because
+it dominates the practical experience: **a named tunnel with a fixed hostname is the
+single highest-value operational change available**, ahead of any latency work. With a
+stable hostname only the token would need rotating, and an agent could reconnect
+unattended.
+
+Mitigation implemented: `capture.wanted` persists the operator's intent, so after a
+restart an agent can see that fast capture *should* be running and that consent was lost,
+instead of silently falling back to slow screenshots.
