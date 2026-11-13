@@ -1002,7 +1002,58 @@ class BridgeHttpServer(
 
         if (path == "/apps/install" && method == Method.POST) {
             val b = readJson(session)
-            return ok(PhoneController.installApk(context, b.getString("path")))
+            val apkPath = b.getString("path")
+            val res = PhoneController.installApk(context, apkPath)
+
+            // An install intent launching is NOT an install. Observed: after five clean
+            // silent installs, the sixth reached Google Play Protect, which replaced the
+            // installer with its own dialog. /apps/install still returned ok:true and the
+            // version never changed, so an agent would conclude success and move on.
+            // Look at the actual screen when we are asked to, and say plainly who has
+            // control of the dialog.
+            if (b.optBoolean("verify", true)) {
+                try {
+                    Thread.sleep(b.optLong("wait_ms", 1800L))
+                    val g = BridgeAccessibilityService.instance
+                    val root = g?.rootInActiveWindow
+                    val pkg = root?.packageName?.toString() ?: ""
+                    val texts = ArrayList<String>()
+                    fun collect(n: android.view.accessibility.AccessibilityNodeInfo, d: Int) {
+                        if (d > 25) return
+                        n.text?.toString()?.takeIf { it.isNotBlank() }?.let { texts.add(it) }
+                        for (i in 0 until n.childCount) n.getChild(i)?.let { collect(it, d + 1) }
+                    }
+                    root?.let { collect(it, 0) }
+                    res.put("dialog_package", pkg)
+                    res.put("dialog_texts", JSONArray(texts.take(8)))
+                    val blockedBy = when {
+                        pkg.contains("vending") -> "play_protect"
+                        pkg.contains("packageinstaller") -> "package_installer"
+                        pkg == "com.cid0980.connectwin" -> "none"
+                        pkg.isEmpty() -> "unknown"
+                        else -> pkg
+                    }
+                    res.put("blocked_by", blockedBy)
+                    // Play Protect offers only "Scan app" / "Don't install app", neither of
+                    // which installs. There is no automation path through it, so say so
+                    // rather than letting the agent tap buttons that cannot work.
+                    if (blockedBy == "play_protect") {
+                        res.put("ok", false)
+                        res.put(
+                            "hint",
+                            "Google Play Protect intercepted the install. It offers only " +
+                                "'Scan app' and 'Don't install app' - scanning reports the app " +
+                                "as suspicious and still does not install it. A human must " +
+                                "temporarily disable Play Protect (Play Store -> profile -> " +
+                                "Play Protect -> settings), or the app must be signed by a " +
+                                "key Play recognises. No tap sequence can bypass this."
+                        )
+                    }
+                } catch (t: Throwable) {
+                    res.put("verify_error", t.javaClass.simpleName)
+                }
+            }
+            return ok(res)
         }
 
         // ==============================================================

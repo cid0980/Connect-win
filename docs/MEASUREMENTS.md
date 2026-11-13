@@ -226,3 +226,36 @@ The game appears to redraw only on discrete state changes, so a tap that does no
 **indistinguishable in frame terms** from a tap that triggers a 4-second animation. This
 puts a floor under remote verification: `verify` cannot resolve faster than the app repaints,
 regardless of pipeline speed.
+
+## 12. Google Play Protect blocks the install, and the bridge called it success
+
+Five installs of this app went through with no prompt at all. The sixth did not:
+
+```
+POST /apps/install  ->  {"ok": true, "prompted_install": "/sdcard/Download/cw-1.6.7.apk"}
+GET  /health        ->  {"version": "1.6.6"}      <- unchanged, 8 polls over 2 minutes
+```
+
+The screen was not the package installer. It was Google Play Protect, in two stages:
+
+1. "App scan recommended" — buttons **Scan app** / **Don't install app**
+2. after scanning — "**Harmful app blocked**. This app may be harmful." with a single **OK**
+
+Neither path installs anything. So there was a window where `/apps/install` returned
+`ok: true`, the version had not changed, and the only thing standing in the way was a dialog
+belonging to `com.android.vending`. An agent reading the response would report success.
+
+Two lessons, both now enforced in code:
+
+- **"The intent launched" is not "the app installed."** The only trustworthy signal is the
+  version reported by `/health` after the fact. `POST /apps/install` now reads the foreground
+  package and text after a short wait, returns `blocked_by` (`play_protect` |
+  `package_installer` | `none`), and switches `ok` to false on Play Protect with a hint.
+- **Some dialogs have no automation path.** Play Protect offers only "scan" and "don't
+  install"; scanning then reports the app as suspicious. There is no tap sequence that
+  installs. `docs` now says so instead of leaving the next agent to try (this cost ~4
+  minutes of confident tapping at a dialog with no correct button).
+
+Why it changed behaviour at all: the same APK, same signing key, that installed silently five
+times. Play Protect's verdict is not stable across attempts, so an install path must never
+assume it will not appear.
