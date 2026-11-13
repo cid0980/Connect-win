@@ -446,3 +446,38 @@ is displaying, not what it thinks is being touched.
 Genshin target is roughly a 200 ms reaction for a dodge to feel intentional, so the open
 rows decide feasibility. The 8 fps figure was measured on a menu-based 2D game idling; it is
 not evidence of what a 3D game at load will do, in either direction.
+
+## 10. Tunnel failure during transfer, not just over time
+
+The reliability appendix counted tunnel deaths as a time-based phenomenon: quick tunnels
+expire between sessions, restart, repeat. The v1.6.5 install showed a second, sharper mode.
+
+```
+POST /files/upload   19,393,142 B   -> 502 Bad gateway mid-body
+10 s later           /health         -> 530
+five retries over 40 s               -> 530, 530, 530, 530, 530
+```
+
+The bridge did not come back on its own. It needed a manual restart on the phone. So a
+single large upload did not merely fail — it **took the bridge offline** and needed a human.
+
+That inverts the priority of the whole install sequence. Installing is already the step that
+must happen last (it kills the bridge by design), and now the transfer that feeds it is the
+most fragile call the bridge makes. Combined:
+
+- largest payload in the system (19 MB)
+- most likely to fail
+- cannot be cheaply retried
+- failure mode is losing the only channel you have
+
+The fix is to stop pushing bytes through the tunnel. `POST /files/fetch {url, path}` pulls a
+file server-side from any https URL, so the tunnel carries a few hundred bytes each way and
+the phone talks to a public host directly. It also verifies `Content-Length` and treats a
+short read as a failure and deletes it — a truncated APK still looks like a successful
+download and later fails to install for a reason that looks like signing.
+
+`/files/upload` is kept and hardened (`.part` file + rename, no half-written destination,
+optional `size` check), but for anything large, fetch beats push.
+
+Generalisation: **any bulk transfer should be pull, not push.** The tunnel is a control
+channel, and it should only ever be asked to carry control-sized messages.

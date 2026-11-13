@@ -1033,8 +1033,91 @@ class BridgeHttpServer(
             val tmpFile = File(tmpFilePath)
             val destFile = PhoneController.resolvePath(context, destParam)
             destFile.parentFile?.mkdirs()
-            tmpFile.copyTo(destFile, overwrite = true)
-            return ok(JSONObject().put("ok", true).put("saved_to", destFile.absolutePath).put("bytes", destFile.length()))
+            // Copy via a .part file and rename, so a destination path never exists in a
+            // half-written state. An APK that is present but truncated is worse than an
+            // absent one: the installer reports a parsing error and the cause looks like
+            // signing or ABI when it was really an interrupted transfer.
+            val part = File(destFile.absolutePath + ".part")
+            runCatching { tmpFile.copyTo(part, overwrite = true) }
+                .getOrElse {
+                    part.delete()
+                    return ok(JSONObject().put("ok", false)
+                        .put("error", "write failed: ${it.javaClass.simpleName}")
+                        .put("hint", "Tunnel or storage interrupted the transfer; nothing was overwritten."))
+                }
+            if (!part.renameTo(destFile)) {
+                part.copyTo(destFile, overwrite = true)
+                part.delete()
+            }
+            val size = destFile.length()
+            val expected = q(session, "size")?.toLongOrNull()
+            return ok(JSONObject().put("ok", true)
+                .put("saved_to", destFile.absolutePath)
+                .put("bytes", size)
+                .put("size_matches", if (expected != null) size == expected else JSONObject.NULL))
+        }
+
+        // Pull a file from ANY https URL, server-side, instead of pushing it through the
+        // tunnel as a request body.
+        //
+        // Why this exists: a 19 MB /files/upload POST killed the Cloudflare tunnel mid-body
+        // and took the bridge offline completely - five retries over 40 s all returned 530,
+        // needing a manual restart on the phone. Uploading is the single most fragile thing
+        // this bridge does, and it is the one step that cannot be retried cheaply because it
+        // has to happen last (installing kills the bridge).
+        //
+        // A URL fetch is small in both directions and, crucially, resumable: if the transfer
+        // fails, the phone retries against a public host by itself with no tunnel traffic.
+        if (path == "/files/fetch" && method == Method.POST) {
+            val b = readJson(session)
+            val url = b.getString("url")
+            val destParam = b.getString("path")
+            if (!url.startsWith("https://")) {
+                throw IllegalArgumentException("url must be https://")
+            }
+            val dest = PhoneController.resolvePath(context, destParam)
+            dest.parentFile?.mkdirs()
+            val tmp = File(dest.absolutePath + ".part")
+            var total = 0L
+            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            try {
+                conn.instanceFollowRedirects = true
+                conn.connectTimeout = 20_000
+                conn.readTimeout = 60_000
+                conn.setRequestProperty("User-Agent", "Connect-win")
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    return ok(JSONObject().put("ok", false).put("http", code)
+                        .put("error", "remote returned $code"))
+                }
+                val expected = conn.contentLengthLong
+                conn.inputStream.use { input ->
+                    tmp.outputStream().use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            total += n
+                        }
+                    }
+                }
+                // Truncated transfers are the failure mode that matters: a short file still
+                // looks like a successful download, and would later install as a corrupt APK.
+                if (expected > 0 && total != expected) {
+                    tmp.delete()
+                    return ok(JSONObject().put("ok", false).put("bytes", total)
+                        .put("expected", expected).put("error", "truncated transfer"))
+                }
+                if (!tmp.renameTo(dest)) {
+                    tmp.copyTo(dest, overwrite = true)
+                    tmp.delete()
+                }
+                return ok(JSONObject().put("ok", true).put("saved_to", dest.absolutePath)
+                    .put("bytes", dest.length()).put("verified_size", expected > 0))
+            } finally {
+                conn.disconnect()
+            }
         }
 
         if (path == "/files/delete" && method == Method.POST) {
