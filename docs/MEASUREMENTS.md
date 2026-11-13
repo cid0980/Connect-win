@@ -182,3 +182,47 @@ Also worth stating for the protocol: **Android dispatches off-screen gestures
 successfully.** A tap at (540, 3000) on a 1080x2400 screen returns `ok: true` and does
 nothing. Combined with the render/physical 2x scale trap, this is the most likely way for
 an agent to be confidently wrong, which is why bounds are now reported explicitly.
+
+## 10. The probe was confidently wrong, and why that matters
+
+First on-device test of `/gui/probe` (v1.6.6) tested five points in the Sleepless City group
+chat: the inert "Go to Room Upgrade" button, its neighbours, the close button that *does*
+work, and a back arrow that *does* work. **All five returned the same verdict.**
+
+```
+dead button   (540,1672) node_not_clickable  nodes=6 android.view.View bounds=[0,0,1080,2400]
+X close       (944,2008) node_not_clickable  nodes=6 android.view.View bounds=[0,0,1080,2400]
+back arrow    (806,562)  node_not_clickable  nodes=6 android.view.View bounds=[0,0,1080,2400]
+```
+
+Root cause: the walk took the *deepest* node claiming the point, and the deepest node was a
+fullscreen container. One fullscreen `View` claims every pixel of the screen, so the probe
+reported the same thing everywhere. A probe that gives the same answer for a working control
+and a dead one is **worse than no probe**, because it inherits the authority of verification
+without the evidence.
+
+Fixed in 1.6.7: nodes whose bounds are ≥90% of the screen are treated as containers, not
+targets, and a new verdict `container_only` says honestly that accessibility has nothing
+useful to say here. That is the correct answer for this entire game (and for Unity/Flutter
+titles): the UI is custom-drawn inside a native shell, so hit testing is invisible.
+
+The uncomfortable lesson is the same one as the accessibility bug in section 6 and the
+`capture.wanted` bug: **a diagnostic that cannot distinguish success from failure is a
+liability, and it is hardest to notice when it agrees with you.**
+
+## 11. First measured reflex-rate sample, and a latency floor
+
+`POST /capture/fps` reported the current rate as **30**, while the same service reported
+`diag.source_fps` of **1.6–2.2**. So the configured rate and the achieved rate are far
+apart on this hardware while the screen is mostly static.
+
+Direct measurement of a tap on the game's own UI, polling `seq`:
+
+```
+tap at t=0 ->  no new frames for 4 s  ->  2 new frames  ->  nothing
+```
+
+The game appears to redraw only on discrete state changes, so a tap that does nothing is
+**indistinguishable in frame terms** from a tap that triggers a 4-second animation. This
+puts a floor under remote verification: `verify` cannot resolve faster than the app repaints,
+regardless of pipeline speed.

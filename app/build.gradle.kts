@@ -11,8 +11,8 @@ android {
         applicationId = "com.cid0980.connectwin"
         minSdk = 30
         targetSdk = 34
-        versionCode = 16
-        versionName = "1.6.6"
+        versionCode = 17
+        versionName = "1.6.7"
 
         ndk {
             abiFilters += listOf("arm64-v8a")

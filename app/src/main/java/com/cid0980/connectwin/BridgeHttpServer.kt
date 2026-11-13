@@ -821,8 +821,22 @@ class BridgeHttpServer(
                     }
                     walk(root, 0)
                     res.put("nodes", hits.size)
-                    if (hits.isNotEmpty()) {
-                        val n = hits.last() // deepest wins
+                    // A node whose bounds are the whole screen is a container, not a target.
+                    // Observed first-hand: every probe point in this game returned the same
+                    // fullscreen android.view.View, so "nodes" was always 6 and the verdict
+                    // was always node_not_clickable - for a working close button and an
+                    // inert game button alike. A probe that returns the same answer for
+                    // opposite situations is worse than no probe: it inherits the false
+                    // confidence of verify without any of its evidence.
+                    val screenArea = sw.toLong() * sh.toLong()
+                    val meaningful = hits.filter { n ->
+                        val r = android.graphics.Rect(); n.getBoundsInScreen(r)
+                        val area = r.width().toLong() * r.height().toLong()
+                        area < screenArea * 9L / 10L
+                    }
+                    res.put("container_only", meaningful.isEmpty() && hits.isNotEmpty())
+                    if (meaningful.isNotEmpty()) {
+                        val n = meaningful.last() // deepest real target wins
                         nodeInfo = JSONObject().apply {
                             put("class", n.className?.toString() ?: "")
                             put("text", n.text?.toString() ?: "")
@@ -840,6 +854,8 @@ class BridgeHttpServer(
                             n.isClickable -> "node_clickable"
                             else -> "node_not_clickable"
                         }
+                    } else if (hits.isNotEmpty()) {
+                        verdict = "container_only"
                     } else {
                         verdict = "no_node"
                     }
@@ -863,6 +879,11 @@ class BridgeHttpServer(
                         "itself. Tapping it is likely ignored; its parent may handle the tap."
                 "node_disabled" -> "The view here is disabled; taps will be swallowed."
                 "node_invisible" -> "The view here is not visible to the user."
+                "container_only" ->
+                    "Only fullscreen containers claim this point, so accessibility cannot " +
+                        "tell you whether it is a real control. The UI is custom-drawn inside " +
+                        "a native shell. Treat every point as unknown and rely on tapping plus " +
+                        "a verified response."
                 "no_node" ->
                     "No native view at this point: this is a custom-drawn surface (Unity, " +
                         "Flutter, Canvas, video). Hit testing is invisible to us, so the only " +
