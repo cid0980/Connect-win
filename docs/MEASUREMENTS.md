@@ -111,3 +111,46 @@ project and a named tunnel is a one-time fix.
 4. **Collect a proper `dispatch→seen` distribution** on combat-like inputs (immediate
    visual response, not UI transitions), at least 20 samples, in-game.
 5. Only then decide on the reflex runtime (M2 in `docs/REALTIME-GENSHIN.md`).
+
+## 6. False-positive capability report (found 13 Nov, fixed in 1.6.3)
+
+Worst bug of the project so far, because it fails silently and in the direction of
+over-confidence:
+
+```
+GET /status  ->  "permissions": { "accessibility": true, ... }
+POST /gui/click  ->  503  AccessibilityService not enabled
+POST /gui/keys   ->  503  AccessibilityService not enabled
+POST /gui/touch  ->  503  AccessibilityService not enabled
+```
+
+`permissions.accessibility` was computed from `isAccessibilityEnabled(ctx)` — the
+*Settings toggle*. After a package update Android kept the toggle ON while the service
+instance was gone, so the bridge advertised full input capability while every input call
+failed. An agent plans around capabilities; a capability report that can be true while
+the capability is dead is worse than no report at all.
+
+Same failure family as `capture.wanted` (fixed 1.6.0): the bridge reporting intent rather
+than state.
+
+Fixed: `/status` now reports `accessibility` (setting AND live), plus
+`accessibility_setting`, `accessibility_live`, and an `accessibility_warning` naming the
+remedy. New `POST /a11y/fix` opens the exact settings screen so recovery is one toggle
+rather than manual navigation — an app cannot re-bind its own accessibility service, so
+that tap is irreducibly human.
+
+## 7. Input that is accepted but ignored, on a specific control
+
+In Sleepless City's group chat, the "Go to Room Upgrade" button (physical 540,1672)
+returned `effect: unchanged` on **11 consecutive attempts**: plain tap, ±25 ms around the
+y band, long press, continuous-touch press, and a left-to-right slide along the bar. It
+carries a ⏩ arrow, which suggests a slide-to-confirm affordance that did not respond to
+any of those.
+
+Controls in the same panel worked normally — opening Group Chat (698 ms), and closing with
+the X (304 ms) — so this is specific to that one control, not broken input.
+
+`verify=1` is what made this legible: on a build without it, all 11 taps would have
+returned `ok: true` and I would have had no way to distinguish "button is broken" from
+"my coordinates are wrong". This is the strongest evidence so far that verification is the
+right default for agent input.

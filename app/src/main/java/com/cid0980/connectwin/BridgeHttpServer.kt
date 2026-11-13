@@ -169,6 +169,25 @@ class BridgeHttpServer(
             return super.serve(session)
         }
 
+        // Recovery helper for a dead AccessibilityService binding. An app cannot
+        // re-bind its own accessibility service (that needs WRITE_SECURE_SETTINGS),
+        // but it can open the exact settings screen so the operator only has to
+        // toggle one switch instead of navigating there manually.
+        if (path == "/a11y/fix" && method == Method.POST) {
+            val live = BridgeAccessibilityService.instance != null
+            if (live) {
+                return ok(JSONObject().put("ok", true).put("needed", false)
+                    .put("accessibility_live", true))
+            }
+            val i = android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(i)
+            return ok(JSONObject().put("ok", true).put("needed", true)
+                .put("opened", "Settings -> Accessibility")
+                .put("instruction", "Toggle Connect-win OFF then ON. Only an on-device tap " +
+                    "can rebind the service; automation cannot do this step."))
+        }
+
         // Unauthenticated local health probe
         if (path == "/health" && method == Method.GET) {
             val snap = BridgeState.snapshot.value

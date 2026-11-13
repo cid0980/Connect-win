@@ -108,8 +108,27 @@ object PhoneController {
             hasPerm(ctx, Manifest.permission.POST_NOTIFICATIONS)
         } else true
 
+        // Distinguish "the setting is on" from "the service is actually bound".
+        // Observed on-device: after a package update Android kept the accessibility
+        // setting ON but the service instance was gone, so /status reported
+        // accessibility: true while every /gui/* call returned 503. A capability
+        // report that can be true while the capability is dead is worse than no
+        // report, because an agent plans around it.
+        val a11ySetting = isAccessibilityEnabled(ctx)
+        val a11yLive = BridgeAccessibilityService.instance != null
         return JSONObject().apply {
-            put("accessibility", isAccessibilityEnabled(ctx))
+            put("accessibility", a11ySetting && a11yLive)
+            put("accessibility_setting", a11ySetting)
+            put("accessibility_live", a11yLive)
+            if (a11ySetting && !a11yLive) {
+                put(
+                    "accessibility_warning",
+                    "Accessibility is enabled in Settings but the service is not bound — " +
+                        "all input (tap/swipe/key) will fail. Toggle Connect-win off and on " +
+                        "in Settings -> Accessibility, or reboot. This can happen after an " +
+                        "app update."
+                )
+            }
             put("notification_listener", isNotificationListenerEnabled(ctx))
             put("all_files", Environment.isExternalStorageManager())
             put("battery_unrestricted", pm.isIgnoringBatteryOptimizations(ctx.packageName))
