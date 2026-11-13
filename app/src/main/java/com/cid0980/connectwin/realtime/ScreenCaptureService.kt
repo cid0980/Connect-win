@@ -132,7 +132,7 @@ class ScreenCaptureService : Service() {
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
     private var maxWidth = 720
-    private var fps = 30
+    @Volatile private var fps = 30
     private var lastFrameAt = 0L
     private var displayListener: DisplayManager.DisplayListener? = null
 
@@ -310,6 +310,21 @@ class ScreenCaptureService : Service() {
      * arriving, or every buffer fails to convert) without an on-device consent prompt,
      * which is the only part of capture an agent cannot do remotely.
      */
+    /**
+     * Change the publish rate at runtime. The published fps was fixed at service start,
+     * which meant "how fast can this phone actually go?" could not be answered without a
+     * restart, and a game that needs 30 fps for reflex evaluation was stuck at whatever
+     * was chosen for a menu-based game. Clamped to 1..60.
+     */
+    fun setFps(target: Int): org.json.JSONObject {
+        val v = target.coerceIn(1, 60)
+        fps = v
+        BridgeState.log("Capture: fps -> $v")
+        return org.json.JSONObject().put("ok", true).put("fps", v)
+    }
+
+    fun currentFps(): Int = fps
+
     fun restartDisplay(): org.json.JSONObject {
         val out = org.json.JSONObject()
         return try {

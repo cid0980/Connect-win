@@ -33,6 +33,18 @@ object ReflexEngine {
         val cooldownMs: Long,
         val normalized: Boolean,
         val maxFires: Long,
+        // Genshin-class input is hold-and-release, not tap. Sumeru puzzles, glider
+        // deployment and charged attacks are all "press while condition holds, release
+        // when it stops". A tap-only engine cannot express that, and a down-action with
+        // no matching release strands a pointer: the character keeps running into a wall
+        // with no way to know why. So a rule may declare on_release, and every forced
+        // release is counted so a stuck pointer is visible rather than mysterious.
+        val onRelease: JSONObject?,
+        // Hard ceiling on how long a press may be held before the watchdog releases it.
+        // Default 0 = no watchdog, but any rule that presses should set it: an agent that
+        // disconnects mid-hold must not leave the phone with a finger stuck down.
+        val maxHoldMs: Long,
+        @Volatile var primedAtMs: Long = 0L,
         @Volatile var enabled: Boolean,
         @Volatile var lastFiredMs: Long = 0L,
         val fires: AtomicLong = AtomicLong(0),
@@ -56,6 +68,9 @@ object ReflexEngine {
     private val evalCount = AtomicLong(0)
     private val fireCount = AtomicLong(0)
     private val droppedCount = AtomicLong(0)
+    private val releaseCount = AtomicLong(0)
+    private val watchdogReleaseCount = AtomicLong(0)
+    private val overlapsAvoided = AtomicLong(0)
 
     // ------------------------------------------------------------------
     // Rule management
@@ -77,6 +92,8 @@ object ReflexEngine {
                 cooldownMs = json.optLong("cooldown_ms", 250L).coerceIn(0L, 60_000L),
                 normalized = json.optBoolean("normalized", true),
                 maxFires = json.optLong("max_fires", 0L),
+                onRelease = json.optJSONObject("on_release"),
+                maxHoldMs = json.optLong("max_hold_ms", 0L).coerceIn(0L, 120_000L),
                 enabled = json.optBoolean("enabled", true)
             )
         }
@@ -109,6 +126,10 @@ object ReflexEngine {
                     put("cooldown_ms", r.cooldownMs)
                     put("normalized", r.normalized)
                     put("fires", r.fires.get())
+                    put("armed", r.primedAtMs > 0L)
+                    put("held_ms", if (r.primedAtMs > 0L) System.currentTimeMillis() - r.primedAtMs else 0L)
+                    put("has_on_release", r.onRelease != null)
+                    put("max_hold_ms", r.maxHoldMs)
                 })
             }
         }
@@ -118,6 +139,12 @@ object ReflexEngine {
             put("evaluations", evalCount.get())
             put("fires", fireCount.get())
             put("coalesced_drops", droppedCount.get())
+            // Safety telemetry. A stuck pointer is one of the few failures in this system
+            // that can leave the phone in a state the agent cannot see from a screenshot,
+            // so the counts are always visible rather than opt-in.
+            put("releases", releaseCount.get())
+            put("watchdog_releases", watchdogReleaseCount.get())
+            put("armed", synchronized(lock) { rules.values.count { it.primedAtMs > 0L } })
             put("rules", arr)
         }
     }
@@ -140,7 +167,35 @@ object ReflexEngine {
                 false
             }
             evalCount.incrementAndGet()
+
+            // Watchdog: a press that outlives max_hold_ms is force-released even if the
+            // release condition never becomes true (scene change, disconnect, a rule that
+            // was gated on a pixel that scrolled away). Without this, "press while boss is
+            // charging" can leave the screen held down forever when the boss dies.
+            if (r.maxHoldMs > 0 && r.primedAtMs > 0 && now - r.primedAtMs >= r.maxHoldMs) {
+                enqueue(r, releaseAllFor(r), isWatchdog = true)
+                r.primedAtMs = 0L
+                continue
+            }
+
             if (matched) {
+                // A rule with on_release latches as armed until its condition stops
+                // matching. While armed we test the RELEASE condition on every frame,
+                // which is what turns a single tap into hold-and-release.
+                if (r.onRelease != null) {
+                    if (r.primedAtMs == 0L) {
+                        if (!r.inFlight.compareAndSet(false, true)) {
+                            droppedCount.incrementAndGet()
+                            continue
+                        }
+                        r.primedAtMs = now
+                        r.lastFiredMs = now
+                        r.fires.incrementAndGet()
+                        fireCount.incrementAndGet()
+                        enqueueNow(r, r.action) { r.inFlight.set(false) }
+                    }
+                    continue
+                }
                 // Coalesce: skip if a previous action for this rule is still pending.
                 if (!r.inFlight.compareAndSet(false, true)) {
                     droppedCount.incrementAndGet()
@@ -149,22 +204,101 @@ object ReflexEngine {
                 r.lastFiredMs = now
                 r.fires.incrementAndGet()
                 fireCount.incrementAndGet()
-                val action = r.action
-                val normalized = r.normalized
-                try {
-                    executor.execute {
-                        try {
-                            runAction(action, normalized)
-                        } finally {
-                            r.inFlight.set(false)
-                        }
+                enqueueNow(r, r.action) { r.inFlight.set(false) }
+                continue
+            }
+
+            // Not matching. If this rule is armed (a press is outstanding) the stimulus
+            // has ended, so release. Checking the explicit on_release condition too lets
+            // a rule release on a *different* pixel than the one it pressed on.
+            if (r.primedAtMs > 0L) {
+                val releaseNow = try {
+                    val rel = r.onRelease
+                    if (rel == null) true
+                    else {
+                        // Only consult on_release if the rule author asked for it; by
+                        // default "the press condition stopped holding" means release.
+                        evalConditionObj(bmpForRelease(), r, rel)
                     }
                 } catch (t: Throwable) {
-                    r.inFlight.set(false)
-                    droppedCount.incrementAndGet()
+                    true
+                }
+                if (releaseNow) {
+                    enqueue(r, releaseAllFor(r), isWatchdog = false)
+                    r.primedAtMs = 0L
                 }
             }
         }
+    }
+
+    /** Snapshot of the frame for release evaluation; keeps the lock short. */
+    private fun bmpForRelease(): Bitmap? = ScreenCaptureService.frameStore.copy()
+
+    private fun enqueue(r: Rule, action: JSONObject, isWatchdog: Boolean) {
+        val releaseAll = action.optBoolean("_release_all", false)
+        try {
+            executor.execute {
+                try {
+                    if (releaseAll) releaseAllPointers() else runAction(action, r.normalized)
+                    if (isWatchdog) watchdogReleaseCount.incrementAndGet()
+                    else releaseCount.incrementAndGet()
+                } catch (t: Throwable) {
+                    BridgeState.log("Reflex release error: ${t.javaClass.simpleName}")
+                } finally {
+                    r.inFlight.set(false)
+                }
+            }
+        } catch (t: Throwable) {
+            r.inFlight.set(false)
+            droppedCount.incrementAndGet()
+            // Executor rejected the release: do not silently lose it, because a lost
+            // release leaves a finger down. Try once on the calling thread.
+            runCatching {
+                if (releaseAll) releaseAllPointers() else runAction(action, r.normalized)
+            }
+        }
+    }
+
+    private fun enqueueNow(r: Rule, action: JSONObject, onDone: () -> Unit) {
+        try {
+            executor.execute {
+                try {
+                    runAction(action, r.normalized)
+                } finally {
+                    onDone()
+                }
+            }
+        } catch (t: Throwable) {
+            onDone()
+            droppedCount.incrementAndGet()
+        }
+    }
+
+    private fun releaseAllFor(r: Rule): JSONObject {
+        val rel = r.onRelease
+        if (rel != null) return rel
+        // Default release: lift every pointer this engine may have pressed.
+        return JSONObject().put("type", "release_all").put("_release_all", true)
+    }
+
+    /** Lift all pointers through the accessibility service. */
+    fun releaseAllPointers() {
+        val svc = BridgeAccessibilityService.instance ?: return
+        try {
+            svc.touchCancelAll()
+        } catch (t: Throwable) {
+            BridgeState.log("releaseAllPointers failed: ${t.javaClass.simpleName}")
+        }
+    }
+
+    private fun evalConditionObj(bmp: Bitmap?, r: Rule, cond: JSONObject): Boolean {
+        if (bmp == null) return true
+        val fake = Rule(
+            id = r.id, condition = cond, action = r.action, cooldownMs = 0L,
+            normalized = r.normalized, maxFires = 0L, onRelease = null,
+            maxHoldMs = 0L, enabled = true
+        )
+        return evalCondition(bmp, fake)
     }
 
     private fun evalCondition(bmp: Bitmap, r: Rule): Boolean {
@@ -217,6 +351,8 @@ object ReflexEngine {
         try {
             val (sw, sh) = svc.screenSize()
             when (action.optString("type", "tap")) {
+                "release_all" -> svc.touchCancelAll()
+                "release" -> svc.touchUp(action.optInt("pointer", 0))
                 "tap" -> {
                     val x = coord(action.optDouble("x", 0.5), normalized, sw)
                     val y = coord(action.optDouble("y", 0.5), normalized, sh)

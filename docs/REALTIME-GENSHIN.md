@@ -396,3 +396,53 @@ unattended.
 Mitigation implemented: `capture.wanted` persists the operator's intent, so after a
 restart an agent can see that fast capture *should* be running and that consent was lost,
 instead of silently falling back to slow screenshots.
+
+## 8. What the reflex engine could not express (fixed in 1.6.5)
+
+An audit of the shipping code against Genshin-class input found the reflex engine had one
+action shape — tap — and no notion of a press ending. Every real-time input in the game is
+hold-and-release: glider deployment, charged attacks, hold-to-sprint, Sumeru puzzles. Three
+concrete consequences:
+
+**A. No release.** A rule that pressed `down` had no path to `up`. The character runs into a
+wall and nothing in the system knows why. The screen keeps moving, so it does not look like
+a failure — the worst kind of bug.
+
+**B. No watchdog.** Nothing bounded hold duration. A rule gated on "boss is charging" whose
+pixel scrolls off-screen leaves the screen held down indefinitely.
+
+**C. Fixed reflex rate.** The publish rate was set once at service start, and reflexes are
+evaluated once per *published* frame — so the published rate is the reflex rate. Measured 8
+fps in practice means a worst-case 125 ms of detection latency before any input is even
+attempted, on top of the game's own frame time.
+
+Fixed:
+
+- `on_release` on a rule — a second condition/action pair evaluated once the press condition
+  stops holding. This turns one rule into a hold-and-release behavioural primitive.
+- `max_hold_ms` — a watchdog that force-releases after the ceiling regardless of conditions.
+  Deliberate: no rule should be able to hold the screen forever.
+- `releases`, `watchdog_releases` and `armed` in `/reflex/rules`, so a stuck press is
+  visible rather than mysterious.
+- `POST /reflex/release_all` — panic release, independent of capture and rules being healthy.
+  This is the "return the phone to a safe state" call.
+- `POST /capture/fps {fps}` — runtime reflex-rate control, clamped 1..60, no restart.
+- `release`, `release_all` action types.
+
+The design principle worth keeping: **any capability that can leave hardware in a state the
+agent cannot observe needs a blind, unconditional way out.** Screenshots show what the phone
+is displaying, not what it thinks is being touched.
+
+## 9. Detection latency budget (partially measured)
+
+| Stage | Known | Status |
+|---|---|---|
+| remote round trip | 350–800 ms | measured |
+| published frame rate | 8 fps after restart, 0.6 fps when stalled | measured |
+| detect at 8 fps | up to 125 ms | derived |
+| on-device evaluate + dispatch | not yet measured | **open** |
+| game's own frame time | unknown for Genshin | **open** |
+
+Genshin target is roughly a 200 ms reaction for a dodge to feel intentional, so the open
+rows decide feasibility. The 8 fps figure was measured on a menu-based 2D game idling; it is
+not evidence of what a 3D game at load will do, in either direction.

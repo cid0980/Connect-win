@@ -350,7 +350,7 @@ class BridgeHttpServer(
                         "touch_state" -> requireA11y().touchState()
                         "touch_tick" -> { requireA11y().setTouchTickMs(request.optLong("tick_ms", 16)); JSONObject().put("ok", true) }
                         "stream_start" -> {
-                            val fps = request.optInt("fps", 15).coerceIn(1, 30)
+                            val fps = request.optInt("fps", 15).coerceIn(1, 60)
                             startStream(fps, request.optInt("max_width", 480).coerceIn(160, 1080), request.optInt("quality", 55).coerceIn(20, 90))
                             JSONObject().put("ok", true).put("streaming", true).put("fps", fps)
                                 .put("capture_running", ScreenCaptureService.isRunning())
@@ -1280,6 +1280,17 @@ class BridgeHttpServer(
                 .put("note", "MediaProjection needs one-time on-device consent. Tap 'Enable fast capture' in the Connect-win app."))
         }
 
+        // Runtime fps control. Genshin-class reflexes are evaluated once per published
+        // frame, so the published rate IS the reflex rate; it has to be adjustable
+        // without a service restart.
+        if (path == "/capture/fps" && method == Method.POST) {
+            val srvc = ScreenCaptureService.instance
+                ?: return ok(JSONObject().put("ok", false).put("error", "capture_not_running"))
+            val b = readJson(session)
+            if (b.has("fps")) return ok(srvc.setFps(b.getInt("fps")))
+            return ok(JSONObject().put("ok", true).put("fps", srvc.currentFps()))
+        }
+
         // Restart the virtual display without losing the MediaProjection grant. Useful
         // when the pipeline stalls (seq frozen) but consent is still held.
         if (path == "/capture/restart" && method == Method.POST) {
@@ -1361,6 +1372,14 @@ class BridgeHttpServer(
                 }
             }
             return ok((found ?: JSONObject().put("matches", 0)).put("ok", true))
+        }
+
+        // Panic release: lift every pointer unconditionally. If an agent ever loses
+        // control, this is the one call that returns the phone to a safe state, so it
+        // must not depend on rules, capture, or anything else being healthy.
+        if (path == "/reflex/release_all" && method == Method.POST) {
+            com.cid0980.connectwin.realtime.ReflexEngine.releaseAllPointers()
+            return ok(JSONObject().put("ok", true).put("released", "all_pointers"))
         }
 
         if (path == "/reflex/rules" && method == Method.GET) {
