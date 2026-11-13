@@ -582,3 +582,40 @@ Candidate 3 is testable and cheap: re-measure arrival rate at `max_width` 1600/1
 instead of 720. If arrival climbs with a larger requested width, the scaling is the cause and
 the fix is to capture at native and downscale on the consumer side. That is the next
 measurement to run, and it decides whether on-device reflexes have any future at all.
+
+## 12. Screen-capture consent cannot be granted remotely (permanent constraint)
+
+After every app update, `POST /capture/status` reports `running: false, wanted: true` — the
+MediaProjection grant is gone, because updating kills the process and Android never persists
+that permission across processes.
+
+Attempted to restore it without a human:
+
+```
+POST /apps/launch com.cid0980.connectwin            -> app foregrounded
+POST /ui/click {"text":"Enable fast capture"}       -> ok:true, accepted:true
+    matched: Button, clickable:true, bounds [96,1244,984,1388], center [540,1316]
+POST /ui/state                                      -> no system dialog appeared
+POST /capture/status                                -> running:false, wanted:true
+```
+
+The click landed on the right control and was delivered through a real accessibility action.
+**No consent dialog was raised.** Android protects `createScreenCaptureIntent()` from synthetic
+input — accepting screen capture requires a genuine human gesture on the device. This is not a
+bridge limitation and cannot be worked around by the bridge, by a different input modality, or
+by root-free trickery.
+
+Consequences worth planning around:
+
+1. **Every update costs a human tap.** Not just the install confirmation — the capture consent
+   too. So each version bump is a two-step manual tax, and shipping many small versions is
+   actively worse than batching changes.
+2. Degraded vision still works while consent is missing: `/screenshot` uses the accessibility
+   screenshot path at roughly 1 frame every 3 s, so an agent can still see menus. What is lost
+   is the frame store that reflexes read — i.e. exactly the fast path this project exists for.
+3. Any long-lived deployment needs to treat capture consent as an **operator action on
+   startup**, listed in the setup checklist next to the accessibility toggle.
+
+Same family as the accessibility rebind in `docs/MEASUREMENTS.md` section 6: the two things
+that actually require a human are **binding input** and **granting sight**. Everything else is
+automatable.
