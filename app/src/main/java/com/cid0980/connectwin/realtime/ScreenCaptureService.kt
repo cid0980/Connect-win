@@ -131,7 +131,7 @@ class ScreenCaptureService : Service() {
     private var imageReader: ImageReader? = null
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
-    private var maxWidth = 720
+    @Volatile private var maxWidth = 720
     @Volatile private var fps = 30
     private var lastFrameAt = 0L
     private var displayListener: DisplayManager.DisplayListener? = null
@@ -316,6 +316,28 @@ class ScreenCaptureService : Service() {
      * restart, and a game that needs 30 fps for reflex evaluation was stuck at whatever
      * was chosen for a menu-based game. Clamped to 1..60.
      */
+    /**
+     * Change the capture width at runtime, recreating the virtual display.
+     *
+     * This exists to settle a specific question: Genshin delivered ~1.4 frames/s while a
+     * 2D menu game delivered ~8, and the throttle was not the cause. One candidate is that
+     * asking the producer for 720 px out of a 2400 px landscape surface forces an expensive
+     * scale inside the GPU pipeline, so frames are dropped BEFORE ImageReader sees them. If
+     * so, requesting a LARGER width should increase the arrival rate - which is the opposite
+     * of the intuitive "smaller is faster" and is worth knowing before optimising anything.
+     */
+    fun setCaptureWidth(target: Int): org.json.JSONObject {
+        val v = target.coerceIn(160, 2400)
+        val before = maxWidth
+        maxWidth = v
+        val r = try { createVirtualDisplay(); null } catch (t: Throwable) { t }
+        return org.json.JSONObject()
+            .put("ok", r == null)
+            .put("was", before)
+            .put("max_width", v)
+            .put("error", r?.let { it.javaClass.simpleName + ": " + it.message })
+    }
+
     fun setFps(target: Int): org.json.JSONObject {
         val v = target.coerceIn(1, 60)
         fps = v
@@ -324,6 +346,8 @@ class ScreenCaptureService : Service() {
     }
 
     fun currentFps(): Int = fps
+
+    fun currentWidth(): Int = maxWidth
 
     fun restartDisplay(): org.json.JSONObject {
         val out = org.json.JSONObject()

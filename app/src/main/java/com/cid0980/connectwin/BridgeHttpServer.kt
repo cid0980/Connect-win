@@ -1456,6 +1456,16 @@ class BridgeHttpServer(
             return ok(JSONObject().put("ok", true).put("fps", srvc.currentFps()))
         }
 
+        // Runtime capture-width control, recreates the virtual display. Used to find out
+        // whether producer-side scaling is what starves the pipeline in 3D games.
+        if (path == "/capture/width" && method == Method.POST) {
+            val srvc = ScreenCaptureService.instance
+                ?: return ok(JSONObject().put("ok", false).put("error", "capture_not_running"))
+            val b = readJson(session)
+            if (b.has("max_width")) return ok(srvc.setCaptureWidth(b.getInt("max_width")))
+            return ok(JSONObject().put("ok", true).put("max_width", srvc.currentWidth()))
+        }
+
         // Restart the virtual display without losing the MediaProjection grant. Useful
         // when the pipeline stalls (seq frozen) but consent is still held.
         if (path == "/capture/restart" && method == Method.POST) {
