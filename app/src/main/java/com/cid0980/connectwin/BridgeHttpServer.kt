@@ -374,6 +374,199 @@ class BridgeHttpServer(
         }
     }
 
+    // ------------------------------------------------------------------
+    // Closed-loop batch helpers. Kept deliberately free of any network access:
+    // everything here runs on the phone so a poll costs a few milliseconds instead
+    // of a 300-800 ms tunnel round trip.
+    // ------------------------------------------------------------------
+
+    /** Sample a pixel from the live frame store, in whichever coordinate space asked. */
+    private fun samplePixel(x: Int, y: Int, normalized: Boolean): Int? {
+        val store = ScreenCaptureService.frameStore
+        return store.use { bmp ->
+            val px = if (normalized) (x * bmp.width).toInt() else x
+            val py = if (normalized) (y * bmp.height).toInt() else y
+            if (px !in 0 until bmp.width || py !in 0 until bmp.height) -1
+            else bmp.getPixel(px.coerceIn(0, bmp.width - 1), py.coerceIn(0, bmp.height - 1))
+        }?.takeIf { it != -1 }
+    }
+
+    private fun colorClose(pixel: Int, target: Int, tol: Int): Boolean {
+        val dr = kotlin.math.abs(android.graphics.Color.red(pixel) - android.graphics.Color.red(target))
+        val dg = kotlin.math.abs(android.graphics.Color.green(pixel) - android.graphics.Color.green(target))
+        val db = kotlin.math.abs(android.graphics.Color.blue(pixel) - android.graphics.Color.blue(target))
+        return dr <= tol && dg <= tol && db <= tol
+    }
+
+    private fun parseColorOrNull(v: String?): Int? = v?.let {
+        runCatching { android.graphics.Color.parseColor(if (it.startsWith("#")) it else "#$it") }.getOrNull()
+    }
+
+    /**
+     * wait_until: block on the phone until a screen condition holds.
+     *
+     * condition: {"type":"pixel","x":0.5,"y":0.5,"color":"#ff0000","tolerance":30}
+     *            {"type":"change"}        - until the frame differs from the entry frame
+     *            {"type":"stable","ms":300} - until the frame stops changing
+     * "change" is the important one: it turns "tap then wait to see if anything
+     * happened" from N round trips into one.
+     */
+    private fun waitUntilStep(st: JSONObject): JSONObject {
+        val cond = st.optJSONObject("condition") ?: JSONObject().put("type", "change")
+        val timeout = st.optLong("timeout_ms", 3000L).coerceIn(50L, 30_000L)
+        val poll = st.optLong("poll_ms", 40L).coerceIn(10L, 500L)
+        val type = cond.optString("type", "change")
+        val t0 = System.currentTimeMillis()
+        val store = ScreenCaptureService.frameStore
+        val startSeq = store.seq
+        var baseline: IntArray? = null
+        var stableSince = 0L
+        var lastSig: Int? = null
+
+        while (System.currentTimeMillis() - t0 < timeout) {
+            when (type) {
+                "pixel" -> {
+                    val x = cond.optInt("x", 0); val y = cond.optInt("y", 0)
+                    val nrm = cond.optBoolean("normalized", true)
+                    val target = parseColorOrNull(cond.optString("color", ""))
+                    val tol = cond.optInt("tolerance", 30)
+                    val px = samplePixel(x, y, nrm)
+                    if (px != null && target != null && colorClose(px, target, tol)) {
+                        return JSONObject().put("ok", true).put("matched", true)
+                            .put("elapsed_ms", System.currentTimeMillis() - t0)
+                            .put("pixel", String.format("#%06X", px and 0xFFFFFF))
+                    }
+                }
+                "change" -> {
+                    val seq = store.seq
+                    if (seq != startSeq) {
+                        return JSONObject().put("ok", true).put("changed", true)
+                            .put("elapsed_ms", System.currentTimeMillis() - t0)
+                            .put("frames", seq - startSeq)
+                    }
+                }
+                "stable" -> {
+                    val sig = store.use { bmp -> fingerprint(bmp) }
+                    val wantMs = cond.optLong("ms", 300L)
+                    if (sig != null) {
+                        if (sig != lastSig) { lastSig = sig; stableSince = System.currentTimeMillis() }
+                        else if (System.currentTimeMillis() - stableSince >= wantMs) {
+                            return JSONObject().put("ok", true).put("stable", true)
+                                .put("elapsed_ms", System.currentTimeMillis() - t0)
+                        }
+                    }
+                }
+                else -> throw IllegalArgumentException("Unknown wait_until type: $type")
+            }
+            Thread.sleep(poll)
+        }
+        return JSONObject().put("ok", false).put("timed_out", true).put("type", type)
+            .put("elapsed_ms", System.currentTimeMillis() - t0)
+    }
+
+    /** Cheap sparse fingerprint: 16x16 grid of luminance, enough to detect any real change. */
+    private fun fingerprint(bmp: android.graphics.Bitmap): Int {
+        var h = 17
+        val gx = 16; val gy = 16
+        for (i in 0 until gx) {
+            for (j in 0 until gy) {
+                val px = bmp.getPixel(
+                    (i * (bmp.width - 1) / (gx - 1)).coerceIn(0, bmp.width - 1),
+                    (j * (bmp.height - 1) / (gy - 1)).coerceIn(0, bmp.height - 1)
+                )
+                h = h * 31 + (android.graphics.Color.red(px) shr 4) * 289 +
+                    (android.graphics.Color.green(px) shr 4) * 17 + (android.graphics.Color.blue(px) shr 4)
+            }
+        }
+        return h
+    }
+
+    /** settle: wait for the screen to stop changing, i.e. an animation finished. */
+    private fun settleStep(st: JSONObject): JSONObject {
+        val timeout = st.optLong("timeout_ms", 3000L).coerceIn(50L, 20_000L)
+        val quietMs = st.optLong("quiet_ms", 250L).coerceIn(20L, 5000L)
+        val store = ScreenCaptureService.frameStore
+        val t0 = System.currentTimeMillis()
+        var last: Int? = null
+        var lastChange = t0
+        while (System.currentTimeMillis() - t0 < timeout) {
+            val sig = store.use { fingerprint(it) }
+            if (sig != null && sig != last) { last = sig; lastChange = System.currentTimeMillis() }
+            if (System.currentTimeMillis() - lastChange >= quietMs) {
+                return JSONObject().put("ok", true).put("settled", true)
+                    .put("quiet_ms", System.currentTimeMillis() - lastChange)
+                    .put("elapsed_ms", System.currentTimeMillis() - t0)
+            }
+            Thread.sleep(30L)
+        }
+        return JSONObject().put("ok", false).put("timed_out", true)
+            .put("elapsed_ms", System.currentTimeMillis() - t0)
+    }
+
+    /** assert: fail the batch if a condition does NOT hold. For "did my tap land?" */
+    private fun assertStep(st: JSONObject): JSONObject {
+        val cond = st.optJSONObject("condition")
+            ?: JSONObject().put("type", "change")
+        val type = cond.optString("type", "change")
+        return when (type) {
+            "pixel" -> {
+                val x = cond.optInt("x", 0); val y = cond.optInt("y", 0)
+                val nrm = cond.optBoolean("normalized", true)
+                val target = parseColorOrNull(cond.optString("color", ""))
+                val tol = cond.optInt("tolerance", 30)
+                val px = samplePixel(x, y, nrm)
+                val good = px != null && target != null && colorClose(px, target, tol)
+                JSONObject().put("ok", good).put("assert", "pixel").put("matched", good)
+                    .put("pixel", px?.let { String.format("#%06X", it and 0xFFFFFF) })
+            }
+            else -> JSONObject().put("ok", true).put("assert", type).put("skipped", "unsupported")
+        }
+    }
+
+    /** Re-execute one step for the repeat feature, sharing the same code path. */
+    private fun executeRepeatStep(st: JSONObject, op: String) {
+        when (op) {
+            "click", "tap" -> requireA11y().tap(st.getInt("x"), st.getInt("y"), st.optLong("duration_ms", 55L))
+            "longpress" -> requireA11y().longPress(st.getInt("x"), st.getInt("y"), st.optLong("duration_ms", 550L))
+            "swipe" -> requireA11y().swipe(
+                st.getInt("x1"), st.getInt("y1"), st.getInt("x2"), st.getInt("y2"),
+                st.optLong("duration_ms", 280L)
+            )
+            "hold" -> requireA11y().touchPress(
+                st.optInt("pointer", 0), st.getInt("x"), st.getInt("y"),
+                st.optLong("duration_ms", 400L)
+            )
+            "touch" -> {
+                val a11y = requireA11y(); val p = st.optInt("pointer", 0)
+                when (st.optString("action", "press")) {
+                    "down" -> a11y.touchDown(p, st.getInt("x"), st.getInt("y"))
+                    "move" -> a11y.touchMove(p, st.getInt("x"), st.getInt("y"))
+                    "up" -> a11y.touchUp(p)
+                    "cancel" -> a11y.touchCancelAll()
+                    else -> a11y.touchPress(p, st.getInt("x"), st.getInt("y"), st.optLong("hold_ms", 80L))
+                }
+            }
+            "key", "keys", "global" -> requireA11y().triggerGlobalAction(
+                st.optString("action", st.optString("combo", "back"))
+            )
+            "ui_click" -> requireA11y().uiClick(
+                ref = if (st.has("ref")) st.optInt("ref") else null,
+                text = st.optString("text", "").ifEmpty { null },
+                desc = st.optString("desc", "").ifEmpty { null },
+                resId = st.optString("id", "").ifEmpty { null },
+                exact = st.optBoolean("exact", false),
+                index = st.optInt("index", 0),
+                longClick = st.optBoolean("long", false),
+                method = st.optString("method", "auto")
+            )
+            "sleep" -> Thread.sleep(
+                (if (st.has("ms")) st.optLong("ms") else (st.optDouble("s", 0.4) * 1000.0).toLong())
+                    .coerceIn(10L, 20_000L)
+            )
+            else -> Unit
+        }
+    }
+
     private fun runBatch(b: JSONObject): JSONObject {
             val steps = b.optJSONArray("steps") ?: throw IllegalArgumentException("Missing steps array")
             require(steps.length() <= 100) { "Maximum 100 batch steps" }
@@ -381,7 +574,14 @@ class BridgeHttpServer(
             val outArr = JSONArray()
             val tStart = System.currentTimeMillis()
 
-            for (i in 0 until steps.length()) {
+            var i = 0
+            var iterations = 0
+            val maxIterations = 2000
+            while (i < steps.length()) {
+                if (++iterations > maxIterations) {
+                    outArr.put(JSONObject().put("ok", false).put("error", "batch exceeded $maxIterations steps (repeat runaway)"))
+                    break
+                }
                 val st = steps.getJSONObject(i)
                 val op = st.optString("op", "").lowercase()
                 val stStart = System.currentTimeMillis()
@@ -501,6 +701,17 @@ class BridgeHttpServer(
                             }
                             JSONObject().put("ok", true)
                         }
+                        // ------------------------------------------------------------------
+                        // Closed-loop batch ops. The whole point of batching is that the
+                        // expensive thing (the tunnel) is paid ONCE, so a sequence must be
+                        // able to *wait for the phone* instead of returning to me between
+                        // steps. Without these, "tap until the screen changes" still costs
+                        // one round trip per attempt, which is the exact cost batching was
+                        // supposed to remove.
+                        // ------------------------------------------------------------------
+                        "wait_until" -> waitUntilStep(st)
+                        "settle" -> settleStep(st)
+                        "assert" -> assertStep(st)
                         "shot" -> {
                             val region = st.optString("region", "").ifEmpty { null }
                             if (region == null) {
@@ -531,6 +742,23 @@ class BridgeHttpServer(
                     stepRes.put("ms", System.currentTimeMillis() - stStart)
                     outArr.put(stepRes)
                     if (!stepRes.optBoolean("ok", true) && stopOnError) break
+                    // repeat: {"op":"...","repeat":N} or on any step. Re-runs THIS step
+                    // N-1 more times without any network traffic, bounded by
+                    // repeat_max_ms so a runaway cannot hang the tunnel request.
+                    val reps = st.optInt("repeat", 1)
+                    if (reps > 1) {
+                        val deadline = System.currentTimeMillis() +
+                            st.optLong("repeat_max_ms", 15_000L).coerceIn(100L, 120_000L)
+                        var n = 1
+                        while (n < reps.coerceAtMost(500) && System.currentTimeMillis() < deadline) {
+                            val t1 = System.currentTimeMillis()
+                            executeRepeatStep(st, op)
+                            n++
+                            if (st.has("repeat_gap_ms")) Thread.sleep(st.optLong("repeat_gap_ms").coerceIn(0L, 5000L))
+                        }
+                        stepRes.put("repeats_done", n)
+                        stepRes.put("ms", System.currentTimeMillis() - stStart)
+                    }
                 } catch (e: Exception) {
                     outArr.put(JSONObject().apply {
                         put("i", i)
